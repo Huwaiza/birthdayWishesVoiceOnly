@@ -7,37 +7,39 @@ with the recipient's name injected at the correct positions.
 
 from typing import List
 
-# Full song structure — each string is one Bark inference line.
+# Full song structure — each string is one Bark inference call.
+# [singing] tag is the key prompt that makes Bark actually sing vs. speak.
+# ♪ markers reinforce melodic delivery.
 # {name} is replaced with the actual name at runtime.
 _SONG_TEMPLATE = [
     # --- verse 1 ---
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday dear {name} ♪",
-    "♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday dear {name} ♪",
+    "[singing] ♪ Happy birthday to you ♪",
     # --- verse 2 ---
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday dear {name} ♪",
-    "♪ May your dreams come true ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday dear {name} ♪",
+    "[singing] ♪ May your dreams come true ♪",
     # --- bridge ---
-    "♪ May your day be filled with joy ♪",
-    "♪ Laughter, love, and happiness ♪",
-    "♪ We're so glad you're in our lives ♪",
-    "♪ Happy birthday {name} ♪",
+    "[singing] ♪ May your day be filled with joy ♪",
+    "[singing] ♪ Laughter, love, and happiness ♪",
+    "[singing] ♪ We're so glad you're in our lives ♪",
+    "[singing] ♪ Happy birthday {name} ♪",
     # --- verse 3 ---
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday to you ♪",
-    "♪ Happy birthday dear {name} ♪",
-    "♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday to you ♪",
+    "[singing] ♪ Happy birthday dear {name} ♪",
+    "[singing] ♪ Happy birthday to you ♪",
     # --- chorus ---
-    "♪ Hip hip hooray, it's your special day ♪",
-    "♪ We sing for you {name}, in every way ♪",
-    "♪ May all your wishes all come true ♪",
-    "♪ Happy birthday, happy birthday to you ♪",
+    "[singing] ♪ Hip hip hooray, it's your special day ♪",
+    "[singing] ♪ We sing for you {name}, in every way ♪",
+    "[singing] ♪ May all your wishes all come true ♪",
+    "[singing] ♪ Happy birthday, happy birthday to you ♪",
     # --- outro ---
-    "♪ Happy birthday dear {name} ♪",
-    "♪ Happy birthday dear {name} ♪",
+    "[singing] ♪ Happy birthday dear {name} ♪",
+    "[singing] ♪ Happy birthday dear {name} ♪",
 ]
 
 # Which line indices start a new section (used for longer pauses during mixing)
