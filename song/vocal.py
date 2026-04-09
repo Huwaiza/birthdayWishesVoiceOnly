@@ -8,8 +8,16 @@ can be regenerated without re-running the whole song.
 """
 
 import hashlib
+import logging
 import os
+import warnings
 from pathlib import Path
+
+# Suppress noisy transformers deprecation warnings — all cosmetic, no effect on output
+logging.getLogger("transformers").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
+warnings.filterwarnings("ignore", message=".*attention_mask.*pad_token_id.*")
+warnings.filterwarnings("ignore", message=".*generation_config.*generation-related arguments.*")
 from typing import List, Optional
 
 import numpy as np
