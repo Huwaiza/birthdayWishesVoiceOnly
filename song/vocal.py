@@ -52,7 +52,6 @@ def _load_models(speaker: str) -> tuple:
         torch_dtype=torch.float16 if device != "cpu" else torch.float32,
     )
     model = model.to(device)
-    model.enable_cpu_offload()  # reduces VRAM/MPS memory pressure
 
     _model_cache["processor"] = processor
     _model_cache["model"] = model
