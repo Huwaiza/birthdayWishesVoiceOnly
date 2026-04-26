@@ -3,3 +3,7 @@ cache/
 __pycache__/
 venv/
 *.pyc
+venv-diffsinger/
+.idea
+.claude
+.DS_Store

@@ -1,9 +1,15 @@
-suno-bark>=0.0.1
-transformers>=4.38.0
-torch>=2.2.0
-pydub>=0.25.1
-librosa>=0.10.1
-soundfile>=0.12.1
-numpy>=1.24.0
-scipy>=1.11.0
-accelerate>=0.26.0
+# Birthday Song Generator v7 — ACE-Step pipeline
+# Install ACE-Step itself separately from git:
+#   git clone https://github.com/ace-step/ACE-Step.git external/ACE-Step
+#   pip install -e external/ACE-Step
+# (ACE-Step is not on PyPI as a current release.)
+
+# These are the deps our own code (song/, generate_birthday.py, batch_render.py) needs
+# on top of whatever ACE-Step pulls in. Versions left loose so we share with ACE-Step's pins.
+numpy
+soundfile
+pydub
+# torch / torchaudio come from ACE-Step's requirements.txt — don't pin here
+
+# Test deps
+pytest

@@ -1,0 +1,13 @@
+# Sample names for batch_render.py.
+# One per line. Blank lines and #-comments are ignored.
+# Mix of short, long, and tricky-pronunciation names so we exercise edge cases.
+Huwaiza
+Sara
+Adam
+Alice
+Mohammed
+Xiomara
+Anastasia
+Jo
+Luc
+Gwyneth
