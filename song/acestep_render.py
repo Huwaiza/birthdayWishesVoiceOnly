@@ -15,23 +15,39 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from .lyrics import build_lyrics
 from .voice_profiles import VOICE_PROFILES, VoiceProfile, pick_voice, seed_for
 
-# Singleton — ACE-Step takes ~30s to warm up, ~3GB RAM. We load once per
-# Python process. The pipeline auto-detects MPS on Apple Silicon.
+# Singleton — the ACE-Step pipeline is loaded once per Python process and
+# reused. It auto-detects MPS on Apple Silicon.
 _PIPELINE = None
 
 
-def _get_pipeline():
+def _get_pipeline(precision: str = "float16"):
     """Lazy-load the ACE-Step pipeline. First call downloads ~4GB of weights
-    from Hugging Face into ~/.cache/ace-step/checkpoints — only happens once."""
+    from Hugging Face into ~/.cache/ace-step/checkpoints — only happens once.
+
+    precision : "float16" (default) or "float32".
+        ACE-Step normally forces float32 on Apple Silicon (MPS). That makes
+        the 3.5B model ~14 GB in RAM — on a Mac with <=18 GB it overflows
+        memory and macOS swaps to disk, turning a few-minute render into a
+        multi-hour one. We override to float16 via the ACE_PIPELINE_DTYPE
+        env var that ACE-Step honours: the model drops to ~7 GB and fits in
+        RAM with no swapping. float16 is the standard precision for diffusion
+        inference, so the quality difference versus float32 is negligible.
+    """
     global _PIPELINE
     if _PIPELINE is not None:
         return _PIPELINE
+
+    # Must be set BEFORE the pipeline is constructed — ACE-Step reads this
+    # env var inside its __init__. setdefault means an externally-set value
+    # (e.g. `export ACE_PIPELINE_DTYPE=float32` in your shell) still wins.
+    os.environ.setdefault("ACE_PIPELINE_DTYPE", precision)
 
     # Defer the heavy import until first call so unit tests / CLI --help
     # don't pay the 5–10s torch import cost.
@@ -39,11 +55,16 @@ def _get_pipeline():
 
     _PIPELINE = ACEStepPipeline(
         checkpoint_dir=None,           # auto = ~/.cache/ace-step/checkpoints
-        dtype="bfloat16",              # auto-falls back to float32 on MPS
+        dtype="bfloat16",              # see ACE_PIPELINE_DTYPE override above
         torch_compile=False,           # MPS doesn't benefit from compile
-        cpu_offload=False,
+        cpu_offload=False,             # offload trades speed for RAM — slower
         overlapped_decode=False,
     )
+    try:
+        print(f"[acestep_render] pipeline ready — device={_PIPELINE.device} "
+              f"dtype={_PIPELINE.dtype}")
+    except Exception:
+        pass
     return _PIPELINE
 
 
@@ -52,6 +73,18 @@ def _hash(*parts: str) -> str:
     for p in parts:
         h.update(p.encode("utf-8"))
     return h.hexdigest()[:12]
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed time, e.g. 4483.0 -> '1h 14m 43s', 92 -> '1m 32s'."""
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 def render(
@@ -64,6 +97,7 @@ def render(
     guidance_scale: float = 15.0,
     use_cache: bool = True,
     verbose: bool = True,
+    precision: str = "float16",
 ) -> Path:
     """
     Render one birthday song end-to-end.
@@ -88,6 +122,10 @@ def render(
         If True, skip render when a matching cached WAV already exists.
     verbose : bool
         Print progress lines.
+    precision : str
+        "float16" (default) or "float32". float16 halves the model's RAM
+        footprint (~7 GB vs ~14 GB) and prevents disk swapping on Macs with
+        <=18 GB. See _get_pipeline() for the full rationale.
 
     Returns
     -------
@@ -128,9 +166,12 @@ def render(
         print(f"[acestep_render] rendering '{name}' → voice={profile.name} seed={seed}")
         print(f"[acestep_render] duration={duration_s:.0f}s steps={infer_step} cfg={guidance_scale}")
 
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(precision=precision)
 
+    started_at = datetime.now()
     t0 = time.time()
+    if verbose:
+        print(f"[acestep_render] render started  {started_at:%Y-%m-%d %H:%M:%S}")
     pipeline(
         format="wav",
         audio_duration=float(duration_s),
@@ -146,13 +187,16 @@ def render(
         batch_size=1,
     )
     dt = time.time() - t0
+    finished_at = datetime.now()
 
     if not cached_wav.exists():
         raise RuntimeError(f"ACE-Step did not produce {cached_wav}")
 
     if verbose:
         size_mb = cached_wav.stat().st_size / (1024 * 1024)
-        print(f"[acestep_render] done in {dt:.1f}s — {size_mb:.1f} MB")
+        print(f"[acestep_render] render finished {finished_at:%Y-%m-%d %H:%M:%S}")
+        print(f"[acestep_render] render took {format_duration(dt)} "
+              f"({dt:.0f}s) — {size_mb:.1f} MB")
 
     if target_wav != cached_wav:
         import shutil

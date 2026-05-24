@@ -20,6 +20,8 @@ Usage
 import argparse
 import sys
 import textwrap
+import time
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -32,6 +34,8 @@ def _wav_to_mp3(wav_path: Path, mp3_path: Path) -> None:
 
 
 def main() -> None:
+    script_t0 = time.time()
+    started_at = datetime.now()
     ap = argparse.ArgumentParser(
         description="Generate a personalised birthday song locally with ACE-Step",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -62,6 +66,10 @@ def main() -> None:
                     help="ACE-Step inference steps (default 60; lower = faster, lower quality)")
     ap.add_argument("--guidance", type=float, default=15.0,
                     help="Classifier-free guidance scale (default 15)")
+    ap.add_argument("--precision", choices=["float16", "float32"], default="float16",
+                    help="Model precision (default float16: ~7 GB RAM, fast). "
+                         "float32 doubles RAM use to ~14 GB; on Macs with "
+                         "<=18 GB that causes disk swapping and very slow renders.")
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Force re-render even if cached")
     ap.add_argument("--list-voices", action="store_true", dest="list_voices",
@@ -99,10 +107,12 @@ def main() -> None:
     print(f"  Voice    : {chosen.name}"
           + (f"  (pinned)" if args.voice is not None else "  (auto-rotated)"))
     print(f"  Duration : {args.duration:.0f}s")
+    print(f"  Precision: {args.precision}")
+    print(f"  Started  : {started_at:%Y-%m-%d %H:%M:%S}")
     print(f"  Output   : {output_mp3}")
     print("=" * 60 + "\n")
 
-    from song.acestep_render import render
+    from song.acestep_render import render, format_duration
     wav_path = render(
         name=args.name,
         voice_index=args.voice,
@@ -111,6 +121,7 @@ def main() -> None:
         guidance_scale=args.guidance,
         use_cache=not args.no_cache,
         verbose=True,
+        precision=args.precision,
     )
 
     print(f"\n[main] WAV ready: {wav_path}")
@@ -118,7 +129,13 @@ def main() -> None:
     _wav_to_mp3(wav_path, output_mp3)
 
     size_mb = output_mp3.stat().st_size / (1024 * 1024)
-    print(f"\n✓  Done!  {size_mb:.1f} MB  →  {output_mp3}")
+    finished_at = datetime.now()
+    elapsed = time.time() - script_t0
+    print("\n" + "=" * 60)
+    print(f"  ✓  Done!  {size_mb:.1f} MB  →  {output_mp3}")
+    print(f"  Started  : {started_at:%Y-%m-%d %H:%M:%S}")
+    print(f"  Finished : {finished_at:%Y-%m-%d %H:%M:%S}")
+    print(f"  Total    : {format_duration(elapsed)}  ({elapsed:.0f}s)")
     print("=" * 60 + "\n")
 
 

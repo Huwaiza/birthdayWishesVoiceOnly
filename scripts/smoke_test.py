@@ -15,9 +15,16 @@ First run takes 5-15 minutes (weight download + warm-up + render).
 Subsequent runs take ~30-90 seconds.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
+
+# Run the model in float16 (~7 GB) instead of ACE-Step's default float32
+# (~14 GB) on Apple Silicon. float32 overflows RAM on Macs with <=18 GB and
+# forces disk swapping — the cause of multi-hour renders. Must be set before
+# the acestep import below.
+os.environ.setdefault("ACE_PIPELINE_DTYPE", "float16")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = PROJECT_ROOT / "scripts" / "smoke_test_out.wav"
@@ -52,6 +59,9 @@ def main():
     )
     print(f"      pipeline constructed in {time.time()-t0:.1f}s "
           f"(weights load lazily on first call)")
+    print(f"      device={pipeline.device}  dtype={pipeline.dtype}")
+    if str(pipeline.dtype) != "torch.float16":
+        print("      WARNING: expected float16 — float32 will be slow on <=18 GB Macs")
 
     print("\n[4/4] Rendering 30s sample...")
     print("      First call also lazy-loads weights — this can take several minutes.")

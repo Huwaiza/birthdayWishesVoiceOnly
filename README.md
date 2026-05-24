@@ -23,7 +23,10 @@ python generate_birthday.py --name "Huwaiza"
 python batch_render.py --names names.txt --out output/
 ```
 
-A 2:30 song renders in ~1–3 minutes on M-series silicon (depends on `--steps`).
+Once the model is loaded, a 2:30 song renders in roughly 5–10 minutes on
+M-series silicon (depends on `--steps` and the chip). If yours is far
+slower than that, see **Performance & memory** below — it's almost always
+a RAM-swapping problem with a one-flag fix.
 
 ---
 
@@ -106,6 +109,44 @@ voice prompt invalidates everyone correctly. Force a re-render with
 
 ---
 
+## Performance & memory
+
+ACE-Step's model is 3.5B parameters. On Apple Silicon (MPS) the library
+defaults to `float32`, which makes the model **~14 GB in RAM**. On a Mac
+with 16–18 GB that overflows physical memory, so macOS swaps to disk —
+and a render that should take minutes takes **hours** (you'll see the
+diffusion bar crawling at 60+ s/iteration).
+
+The fix: render in **`float16`**, which halves the model to **~7 GB** and
+keeps it entirely in RAM. This is now the **default**. `float16` is the
+standard precision for diffusion inference, so audio quality is
+effectively identical to `float32` — you just stop swapping. Under the
+hood this sets the `ACE_PIPELINE_DTYPE=float16` env var that ACE-Step
+honours.
+
+```bash
+# float16 is the default — nothing to do
+python generate_birthday.py --name "Huwaiza"
+
+# force full float32 (only worth it on a Mac with 32 GB+)
+python generate_birthday.py --name "Huwaiza" --precision float32
+```
+
+Other tips for high throughput:
+
+- **Use `batch_render.py`, not a loop of `generate_birthday.py`.** The
+  ~1–2 min model load happens *once* per process; a batch amortises it
+  across every name. Running the single-name CLI 30 times reloads the
+  model 30 times — that alone wastes ~30–60 minutes.
+- **Quit other memory-hungry apps** (browsers especially) before a big
+  batch. Every GB of free RAM is one less GB that might swap.
+- **Run big batches overnight.** At ~5–10 min/song, 20–30 songs is a
+  3–5 hour unattended run — start it, collect the MP3s in the morning.
+- The first render of any session also downloads ~4 GB of weights (once,
+  ever) and loads them — budget a few extra minutes for run #1.
+
+---
+
 ## CLI reference
 
 `generate_birthday.py` — single name:
@@ -117,6 +158,7 @@ voice prompt invalidates everyone correctly. Force a re-render with
 | `--duration`     | `150` (seconds, = 2:30)      | Song length                            |
 | `--steps`        | `60`                         | Diffusion steps. Lower = faster, lower quality |
 | `--guidance`     | `15.0`                       | Classifier-free guidance scale         |
+| `--precision`    | `float16`                    | `float16` (~7 GB RAM) or `float32` (~14 GB) |
 | `--output`       | `happy_birthday_<name>.mp3`  | Output MP3 path                        |
 | `--no-cache`     | off                          | Skip the cache, always re-render       |
 | `--list-voices`  | —                            | Print profiles and exit                |
@@ -130,6 +172,7 @@ voice prompt invalidates everyone correctly. Force a re-render with
 | `--duration`     | `150`         | Per-song length                             |
 | `--steps`        | `60`          | Diffusion steps                             |
 | `--guidance`     | `15.0`        | CFG scale                                   |
+| `--precision`    | `float16`     | `float16` (~7 GB RAM) or `float32` (~14 GB)  |
 | `--retries`      | `1`           | Per-name retry count on failure             |
 | `--voice N`      | rotate        | Pin all renders to one voice                |
 | `--no-cache`     | off           | Always re-render                            |
@@ -204,6 +247,9 @@ first real song.
 
 ## Tuning
 
+- **Render speed, no quality cost**: keep the default `--precision float16`
+  (see **Performance & memory**). This is the single biggest speedup on a
+  Mac with 16–18 GB RAM.
 - **Faster but rougher renders**: `--steps 30 --guidance 12`
 - **Slower but cleaner renders**: `--steps 90 --guidance 18`
 - **Different vocal style**: edit `song/voice_profiles.py` — each profile is
