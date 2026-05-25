@@ -99,6 +99,45 @@ done
 
 ---
 
+## A cappella (vocals only)
+
+ACE-Step always renders a full mix — the voice plus a backing band. To get
+an instrument-free version, pass `--acapella`:
+
+```bash
+python generate_birthday.py --name "Huwaiza" --acapella
+python batch_render.py --names names.txt --out output/ --acapella
+```
+
+This renders the full song as usual, then runs the result through a
+**Roformer** vocal-separation model (via
+[audio-separator](https://pypi.org/project/audio-separator/)) and keeps
+only the vocal stem. Roformer is the current state of the art for vocal
+isolation — it physically pulls the recording apart into stems, so the
+result is instrument-free for real, unlike just prompting for "a cappella"
+(which a generative model may not honour). It also doesn't leak an
+instrumental intro/outro into the vocal stem the way older models do.
+
+One pass is deliberate: a second "cleanup" pass would scrub a touch more
+residue but start adding a faint, watery artefact to the voice itself —
+not worth it when the goal is a pristine vocal.
+
+Trade-offs:
+
+- Adds roughly 2–5 minutes per song — separation runs on CPU.
+- Needs `audio-separator`: `pip install "audio-separator[cpu]"`. A fresh
+  install via `scripts/install_acestep.sh` already includes it (it's in
+  `requirements.txt`). The Roformer model (~200 MB) downloads once, on
+  first use, into `~/.cache/audio-separator-models/`.
+- Output goes to `happy_birthday_<name>_acapella.mp3`, so it never
+  overwrites the full-song version.
+
+The isolated-vocal WAV is cached alongside the full render, so re-running
+`--acapella` for the same name is instant. Force a re-separation with
+`--no-cache`.
+
+---
+
 ## Caching
 
 Rendered WAVs are cached in `cache/acestep/`. The cache key is a hash of
@@ -159,6 +198,7 @@ Other tips for high throughput:
 | `--steps`        | `60`                         | Diffusion steps. Lower = faster, lower quality |
 | `--guidance`     | `15.0`                       | Classifier-free guidance scale         |
 | `--precision`    | `float16`                    | `float16` (~7 GB RAM) or `float32` (~14 GB) |
+| `--acapella`     | off                          | Vocals only — strip instruments with a Roformer model |
 | `--output`       | `happy_birthday_<name>.mp3`  | Output MP3 path                        |
 | `--no-cache`     | off                          | Skip the cache, always re-render       |
 | `--list-voices`  | —                            | Print profiles and exit                |
@@ -173,6 +213,7 @@ Other tips for high throughput:
 | `--steps`        | `60`          | Diffusion steps                             |
 | `--guidance`     | `15.0`        | CFG scale                                   |
 | `--precision`    | `float16`     | `float16` (~7 GB RAM) or `float32` (~14 GB)  |
+| `--acapella`     | off           | Vocals only — strip instruments with a Roformer model |
 | `--retries`      | `1`           | Per-name retry count on failure             |
 | `--voice N`      | rotate        | Pin all renders to one voice                |
 | `--no-cache`     | off           | Always re-render                            |
@@ -196,7 +237,8 @@ birthdayVoiceOnly/
 ├── song/                   Python package
 │   ├── lyrics.py             Tagged lyrics builder
 │   ├── voice_profiles.py     4 female voice prompts + deterministic rotation
-│   └── acestep_render.py     ACE-Step pipeline wrapper + cache
+│   ├── acestep_render.py     ACE-Step pipeline wrapper + cache
+│   └── vocal_isolate.py      Roformer vocal-stem isolation (--acapella)
 │
 ├── external/
 │   └── ACE-Step/           Cloned by scripts/install_acestep.sh
@@ -277,5 +319,6 @@ serves as the integration test.
 ## Credits
 
 - Music synthesis: [ACE-Step 1.5](https://github.com/ace-step/ACE-Step) by ACE Studio & StepFun AI (Apache 2.0)
+- Vocal isolation: [audio-separator](https://pypi.org/project/audio-separator/) with a BS-Roformer model (`--acapella`)
 - Audio I/O: [pydub](https://github.com/jiaaro/pydub), [soundfile](https://github.com/bastibe/python-soundfile)
 - Apple Silicon acceleration: [PyTorch MPS](https://pytorch.org/docs/stable/notes/mps.html)

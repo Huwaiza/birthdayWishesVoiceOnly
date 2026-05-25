@@ -70,6 +70,10 @@ def main() -> None:
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use to ~14 GB; on Macs with "
                          "<=18 GB that causes disk swapping and very slow renders.")
+    ap.add_argument("--acapella", action="store_true",
+                    help="Vocals only: render the full song, then strip every "
+                         "instrument with a Roformer model "
+                         "(needs `pip install \"audio-separator[cpu]\"`)")
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Force re-render even if cached")
     ap.add_argument("--list-voices", action="store_true", dest="list_voices",
@@ -95,7 +99,8 @@ def main() -> None:
         ap.error("--name is required (or use --list-voices)")
 
     safe = args.name.lower().replace(" ", "_")
-    output_mp3 = Path(args.output or f"happy_birthday_{safe}.mp3")
+    suffix = "_acapella" if args.acapella else ""
+    output_mp3 = Path(args.output or f"happy_birthday_{safe}{suffix}.mp3")
     if not output_mp3.is_absolute():
         output_mp3 = SCRIPT_DIR / output_mp3
 
@@ -108,6 +113,7 @@ def main() -> None:
           + (f"  (pinned)" if args.voice is not None else "  (auto-rotated)"))
     print(f"  Duration : {args.duration:.0f}s")
     print(f"  Precision: {args.precision}")
+    print(f"  Mode     : {'a cappella — vocals only' if args.acapella else 'full song — vocals + backing'}")
     print(f"  Started  : {started_at:%Y-%m-%d %H:%M:%S}")
     print(f"  Output   : {output_mp3}")
     print("=" * 60 + "\n")
@@ -125,6 +131,17 @@ def main() -> None:
     )
 
     print(f"\n[main] WAV ready: {wav_path}")
+
+    if args.acapella:
+        from song.vocal_isolate import isolate_vocals
+        vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
+        if vocals_wav.exists() and not args.no_cache:
+            print(f"[main] cached vocal stem: {vocals_wav.name}")
+        else:
+            print(f"[main] Isolating vocals — removing all instruments...")
+            isolate_vocals(wav_path, vocals_wav, verbose=True)
+        wav_path = vocals_wav
+
     print(f"[main] Encoding 192 kbps MP3 → {output_mp3}")
     _wav_to_mp3(wav_path, output_mp3)
 

@@ -9,6 +9,7 @@
 numpy
 soundfile
 pydub
+audio-separator[cpu]  # Roformer vocal isolation, used by --acapella mode
 # torch / torchaudio come from ACE-Step's requirements.txt — don't pin here
 
 # Test deps
