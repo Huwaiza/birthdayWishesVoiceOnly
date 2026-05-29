@@ -20,9 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .lyrics import build_lyrics
-from .voice_profiles import (
-    VOICE_PROFILES, VoiceProfile, pick_voice, prompt_for, seed_for,
-)
+from .voice_profiles import VOICE_PROFILES, VoiceProfile, pick_voice, seed_for
 
 # Singleton — the ACE-Step pipeline is loaded once per Python process and
 # reused. It auto-detects MPS on Apple Silicon.
@@ -100,7 +98,6 @@ def render(
     use_cache: bool = True,
     verbose: bool = True,
     precision: str = "float16",
-    with_music: bool = False,
 ) -> Path:
     """
     Render one birthday song end-to-end.
@@ -129,12 +126,6 @@ def render(
         "float16" (default) or "float32". float16 halves the model's RAM
         footprint (~7 GB vs ~14 GB) and prevents disk swapping on Macs with
         <=18 GB. See _get_pipeline() for the full rationale.
-    with_music : bool
-        False (default) → render the a cappella / continuous-singing
-        prompt, the right raw material for the vocals-only pipeline (no
-        instrumental intro/breaks/outro, so nothing becomes a long silent
-        gap after isolation). True → render the full piano-ballad
-        arrangement, used by --with-music.
 
     Returns
     -------
@@ -143,7 +134,6 @@ def render(
     profile = pick_voice(name, override_index=voice_index)
     seed = seed_for(profile, name)
     lyrics = build_lyrics(name)
-    prompt = prompt_for(profile, with_music)
 
     cache_dir = Path(cache_dir) if cache_dir else (
         Path(__file__).resolve().parent.parent / "cache" / "acestep"
@@ -154,8 +144,7 @@ def render(
         name.strip().lower(),
         profile.name,
         str(seed),
-        "with-music" if with_music else "vocal-only",
-        prompt,
+        profile.prompt,
         lyrics,
         f"{duration_s:.1f}",
         f"{infer_step}",
@@ -174,8 +163,7 @@ def render(
         return target_wav
 
     if verbose:
-        print(f"[acestep_render] rendering '{name}' → voice={profile.name} "
-              f"seed={seed} mode={'with-music' if with_music else 'vocal-only'}")
+        print(f"[acestep_render] rendering '{name}' → voice={profile.name} seed={seed}")
         print(f"[acestep_render] duration={duration_s:.0f}s steps={infer_step} cfg={guidance_scale}")
 
     pipeline = _get_pipeline(precision=precision)
@@ -187,7 +175,7 @@ def render(
     pipeline(
         format="wav",
         audio_duration=float(duration_s),
-        prompt=prompt,
+        prompt=profile.prompt,
         lyrics=lyrics,
         infer_step=infer_step,
         guidance_scale=guidance_scale,

@@ -40,8 +40,8 @@ from pathlib import Path
 # BS-Roformer — a state-of-the-art vocal-separation model (SDR ~12.98).
 # Its weights (~200 MB) download once on first use into the cache dir below.
 # To try a different model, run `audio-separator --list_models` and swap
-# this string (then re-run with --no-cache so the new model re-isolates —
-# the isolated-vocal WAV is otherwise cached by filename).
+# this string (the WAV cache for --acapella is keyed separately, so a model
+# change just means the next render re-isolates).
 _ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 
 # Persist downloaded model weights here so they survive reboots — the
@@ -93,8 +93,7 @@ def isolate_vocals(
         from audio_separator.separator import Separator
     except ImportError as e:
         raise RuntimeError(
-            "audio-separator is not installed — it powers the default "
-            "vocals-only mode.\n"
+            "audio-separator is not installed — it powers --acapella.\n"
             "    pip install \"audio-separator[cpu]\""
         ) from e
 
@@ -179,23 +178,39 @@ def _pick_vocal_stem(outputs, work_dir: Path):
 
 # --- Pause tightening -------------------------------------------------------
 #
-# ACE-Step composes a song *arrangement*, so even an a cappella-prompted
-# render leaves some instrumental space — a short intro, fills between
-# sections, an outro. Once the backing is separated out, those stretches
-# become long silences. tighten_pauses() collapses them so the vocal-only
-# track is continuous and production-ready.
+# Even with an a cappella result, ACE-Step composed a song *arrangement*, so
+# the isolated vocal still has the ghosts of the instrumental intro, fills,
+# and outro — long stretches that are now pure silence. tighten_pauses()
+# shrinks ONLY those long silent gaps so the song doesn't drag, while leaving
+# every sung note exactly as performed.
+#
+# Melody safety is the whole point here. The detector is deliberately timid:
+#
+#   * Threshold is _SILENCE_DBFS, an ABSOLUTE floor far below any sung note.
+#     A clean Roformer stem's silence sits near digital zero (~-90 dBFS),
+#     while even the softest sung tail stays well above -50 dBFS — so notes
+#     are never mistaken for silence and cut. (My earlier attempt used a
+#     level *relative* to the track's loudness, which clipped soft singing.)
+#   * Only gaps >= _LONG_GAP_MS (a full second) are touched. Shorter pauses —
+#     breaths, phrase ends, the space between words — are left untouched.
+#   * Each kept phrase is padded by _PHRASE_PAD_MS so note onsets and decay
+#     tails survive the cut, then given a tiny _FADE_MS fade purely to avoid
+#     a click at the splice (not enough to be audible as a fade).
 
-# A silent stretch longer than this (ms) is treated as a leftover
-# instrumental gap and collapsed; anything shorter is natural phrasing
-# and is kept exactly as the singer performed it.
-_LONG_GAP_MS = 700
+# A silent stretch at least this long (ms) is a leftover instrumental gap and
+# gets collapsed; anything shorter is natural phrasing and is kept verbatim.
+_LONG_GAP_MS = 1000
 # Collapsed gaps become this much silence — one natural breath.
-_KEPT_GAP_MS = 350
+_KEPT_GAP_MS = 450
 # Leading / trailing silence is trimmed down to this small, even pad.
-_EDGE_PAD_MS = 150
-# A little audio kept on each side of a phrase so consonants at the
-# start/end of a line aren't clipped off.
-_PHRASE_PAD_MS = 60
+_EDGE_PAD_MS = 250
+# Audio kept on each side of a phrase so note onsets/tails aren't clipped.
+_PHRASE_PAD_MS = 120
+# Tiny fade on each phrase edge to declick the splice (inaudible as a fade).
+_FADE_MS = 8
+# Absolute silence floor (dBFS). Well below the softest sung note, well above
+# a clean vocal stem's near-digital-silence noise floor.
+_SILENCE_DBFS = -55.0
 
 
 def _silence(ms, like):
@@ -211,13 +226,13 @@ def tighten_pauses(
     verbose: bool = True,
 ) -> Path:
     """
-    Collapse the long silent gaps in an isolated-vocal WAV.
+    Collapse only the long silent gaps in an isolated-vocal WAV.
 
-    Detects silences longer than ~0.7 s — the ghosts of the instrumental
+    Detects silences at least ~1 s long — the ghosts of the instrumental
     intro / fills / outro — and shrinks each to a single natural breath
-    (~0.35 s), then trims the silent head and tail. Short pauses are left
-    untouched, so the result still breathes like a real performance
-    instead of sounding rushed.
+    (~0.45 s), then trims the silent head and tail. Short pauses and every
+    sung note are left untouched, so the melody is preserved exactly and the
+    song simply stops dragging.
 
     Parameters
     ----------
@@ -242,8 +257,8 @@ def tighten_pauses(
     if not input_wav.exists():
         raise FileNotFoundError(f"input WAV not found: {input_wav}")
 
-    # pydub is a hard project dependency, but imported lazily so this
-    # module stays importable on its own (the unit tests rely on that).
+    # pydub is a hard project dependency, but imported lazily so this module
+    # stays importable on its own (the unit tests rely on that).
     from pydub import AudioSegment
     from pydub.silence import detect_nonsilent
 
@@ -251,22 +266,18 @@ def tighten_pauses(
     audio = AudioSegment.from_wav(str(input_wav))
     total_ms = len(audio)
 
-    # Threshold relative to the track's own loudness, so it adapts to
-    # whatever absolute level the separator produced.
-    silence_thresh = audio.dBFS - 16
-
     # Only silences >= _LONG_GAP_MS split the audio; shorter pauses stay
     # inside a non-silent run and are therefore preserved untouched.
     nonsilent = detect_nonsilent(
         audio,
         min_silence_len=_LONG_GAP_MS,
-        silence_thresh=silence_thresh,
-        seek_step=10,
+        silence_thresh=_SILENCE_DBFS,
+        seek_step=5,
     )
 
     if not nonsilent:
-        # No singing detected (or the file is unexpectedly quiet) — copy
-        # it through untouched rather than emit an empty file.
+        # No singing detected (or the file is unexpectedly quiet) — copy it
+        # through untouched rather than emit an empty file.
         output_wav.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(input_wav), str(output_wav))
         if verbose:
@@ -277,12 +288,13 @@ def tighten_pauses(
     kept_gap = _silence(_KEPT_GAP_MS, audio)
     out = AudioSegment.empty()
     for i, (start, end) in enumerate(nonsilent):
-        # Pad each phrase slightly so onsets/tails aren't clipped.
+        # Pad each phrase so onsets/decay tails survive; fade only to declick.
         s = max(0, start - _PHRASE_PAD_MS)
         e = min(total_ms, end + _PHRASE_PAD_MS)
+        chunk = audio[s:e].fade_in(_FADE_MS).fade_out(_FADE_MS)
         if i > 0:
             out += kept_gap
-        out += audio[s:e]
+        out += chunk
 
     edge = _silence(_EDGE_PAD_MS, audio)
     out = edge + out + edge
@@ -295,5 +307,5 @@ def tighten_pauses(
         trimmed = (total_ms - len(out)) / 1000.0
         print(f"[tighten_pauses] {len(nonsilent)} phrase group(s), "
               f"{total_ms / 1000:.1f}s → {len(out) / 1000:.1f}s "
-              f"(removed {trimmed:.1f}s of gaps) in {dt:.0f}s")
+              f"(removed {trimmed:.1f}s of dead air) in {dt:.0f}s")
     return output_wav

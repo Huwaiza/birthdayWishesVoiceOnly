@@ -1,9 +1,8 @@
 # Birthday Song Generator (v7)
 
-Generates a personalised, production-quality birthday song from a name,
-locally on an Apple Silicon Mac. Songs are **vocals-only** (a cappella) by
-default; pass `--with-music` for the full backing band. Free for unlimited
-renders — no API, no per-song cost.
+Generates a personalised, production-quality 2:30 birthday song from a name,
+locally on an Apple Silicon Mac. Free for unlimited renders — no API, no
+per-song cost.
 
 Powered by [ACE-Step 1.5](https://github.com/ace-step/ACE-Step), an
 open-source music foundation model (Apache 2.0).
@@ -17,22 +16,17 @@ After the one-time install (see below), this is your daily workflow:
 ```bash
 source venv-diffsinger/bin/activate
 
-# One song — vocals only (a cappella), the default
+# One song
 python generate_birthday.py --name "Huwaiza"
 
-# One song — with the full backing band
-python generate_birthday.py --name "Huwaiza" --with-music
-
-# A batch (vocals only)
+# A batch
 python batch_render.py --names names.txt --out output/
 ```
 
-Once the model is loaded, the diffusion render takes roughly 5–10 minutes
-on M-series silicon (depends on `--steps` and the chip). The default
-vocals-only mode then spends another ~2–5 minutes isolating the voice and
-tightening pauses. If a render is far slower than that, see **Performance
-& memory** below — it's almost always a RAM-swapping problem with a
-one-flag fix.
+Once the model is loaded, a 2:30 song renders in roughly 5–10 minutes on
+M-series silicon (depends on `--steps` and the chip). If yours is far
+slower than that, see **Performance & memory** below — it's almost always
+a RAM-swapping problem with a one-flag fix.
 
 ---
 
@@ -66,19 +60,12 @@ song/acestep_render.py    → Calls ACE-Step with prompt + lyrics + seed,
                             caches the WAV by hash(everything).
     │
     ▼
-song/vocal_isolate.py     → DEFAULT (vocals-only): a Roformer model
-                            strips the backing, then tighten_pauses()
-                            collapses the leftover instrumental gaps.
-                            Skipped when you pass --with-music.
-    │
-    ▼
-generate_birthday.py      → Encodes the final WAV to a 192 kbps MP3.
+generate_birthday.py      → Encodes the WAV to a 192 kbps MP3.
 ```
 
-ACE-Step composes the melody, sings it, and mixes a band on every render
-— no backing-track loops, no MIDI authoring. For the default vocals-only
-output, that band is then separated back out and the song tightened into
-a clean a cappella track.
+That's the whole thing. No backing-track loops, no separate vocal/mix
+stages, no MIDI authoring — ACE-Step composes melody, sings it, and mixes
+the band on every render.
 
 ---
 
@@ -112,71 +99,49 @@ done
 
 ---
 
-## Vocals only vs. with music
+## A cappella (vocals only)
 
-**Vocals only (a cappella) is the default.** Run the CLI with no mode
-flag and you get a clean, instrument-free vocal:
-
-```bash
-python generate_birthday.py --name "Huwaiza"
-python batch_render.py --names names.txt --out output/
-```
-
-Pass `--with-music` to instead get the full song — the voice plus a warm
-piano-ballad backing band:
+ACE-Step always renders a full mix — the voice plus a backing band. To get
+an instrument-free version, pass `--acapella`:
 
 ```bash
-python generate_birthday.py --name "Huwaiza" --with-music
-python batch_render.py --names names.txt --out output/ --with-music
+python generate_birthday.py --name "Huwaiza" --acapella
+python batch_render.py --names names.txt --out output/ --acapella
 ```
 
-### How vocals-only works
+This renders the full song as usual, then runs the result through a
+**Roformer** vocal-separation model (via
+[audio-separator](https://pypi.org/project/audio-separator/)) and keeps
+only the vocal stem. Roformer is the current state of the art for vocal
+isolation — it physically pulls the recording apart into stems, so the
+result is instrument-free for real, unlike just prompting for "a cappella"
+(which a generative model may not honour). It also doesn't leak an
+instrumental intro/outro into the vocal stem the way older models do.
 
-ACE-Step is a *song* model — it always wants to compose an arrangement.
-So the vocals-only pipeline takes three steps:
+One pass is deliberate: a second "cleanup" pass would scrub a touch more
+residue but start adding a faint, watery artefact to the voice itself —
+not worth it when the goal is a pristine vocal.
 
-1. **Render** with an a cappella-oriented prompt — the model is asked for
-   continuous solo singing with no instrumental intro, breaks, or outro.
-   That already minimises the instrumental space.
-2. **Isolate** with a **Roformer** model (via
-   [audio-separator](https://pypi.org/project/audio-separator/)) — the
-   current state of the art for vocal separation. It physically pulls the
-   recording into stems and keeps only the voice, so the result is
-   instrument-free for real. One pass only: a second cleanup pass would
-   scrub marginally more residue but add a watery artefact to the voice.
-3. **Tighten** with `tighten_pauses()` — even an a cappella-prompted
-   render leaves a little instrumental space, which becomes silence once
-   the backing is gone. This pass collapses any gap longer than ~0.7 s to
-   a single natural breath (~0.35 s) and trims the silent head/tail.
-   Short, natural pauses between phrases are kept, so it still breathes
-   like a real performance.
+Trade-offs:
 
-The result is a continuous, production-ready vocal with no awkward gaps
-where a backing track used to be.
+- Adds roughly 2–5 minutes per song — separation runs on CPU.
+- Needs `audio-separator`: `pip install "audio-separator[cpu]"`. A fresh
+  install via `scripts/install_acestep.sh` already includes it (it's in
+  `requirements.txt`). The Roformer model (~200 MB) downloads once, on
+  first use, into `~/.cache/audio-separator-models/`.
+- Output goes to `happy_birthday_<name>_acapella.mp3`, so it never
+  overwrites the full-song version.
 
-### Notes
-
-- Vocals-only adds roughly 2–5 minutes per song on top of the render —
-  isolation runs on CPU.
-- It needs `audio-separator`: `pip install "audio-separator[cpu]"`. A
-  fresh install via `scripts/install_acestep.sh` already includes it
-  (it's in `requirements.txt`). The Roformer model (~200 MB) downloads
-  once, on first use, into `~/.cache/audio-separator-models/`.
-- The default vocals-only song is naturally short (~1–1.5 min). The
-  `--with-music` song aims for ~2:30 — both adjustable via `--duration`.
-- `--with-music` output gets a `_with_music` suffix
-  (`happy_birthday_<name>_with_music.mp3`) so it never overwrites the
-  vocals-only file.
-- Every intermediate WAV (full render, isolated stem, tightened vocal) is
-  cached, so re-running is instant. Force a redo with `--no-cache`.
+The isolated-vocal WAV is cached alongside the full render, so re-running
+`--acapella` for the same name is instant. Force a re-separation with
+`--no-cache`.
 
 ---
 
 ## Caching
 
 Rendered WAVs are cached in `cache/acestep/`. The cache key is a hash of
-`(name, voice profile, mode, prompt, lyrics, duration, steps, guidance)`.
-So
+`(name, voice profile, prompt, lyrics, duration, steps, guidance)`. So
 calling the same name + voice twice is instant; tweaking the lyrics or a
 voice prompt invalidates everyone correctly. Force a re-render with
 `--no-cache`.
@@ -214,9 +179,8 @@ Other tips for high throughput:
   model 30 times — that alone wastes ~30–60 minutes.
 - **Quit other memory-hungry apps** (browsers especially) before a big
   batch. Every GB of free RAM is one less GB that might swap.
-- **Run big batches overnight.** Budget ~7–15 min per vocals-only song
-  (render + isolation + tightening), so 20–30 songs is a 3–7 hour
-  unattended run — start it, collect the MP3s in the morning.
+- **Run big batches overnight.** At ~5–10 min/song, 20–30 songs is a
+  3–5 hour unattended run — start it, collect the MP3s in the morning.
 - The first render of any session also downloads ~4 GB of weights (once,
   ever) and loads them — budget a few extra minutes for run #1.
 
@@ -230,11 +194,11 @@ Other tips for high throughput:
 |------------------|------------------------------|----------------------------------------|
 | `--name`         | required                     | The recipient's name                   |
 | `--voice N`      | `MD5(name) % 4`              | Pin a specific voice profile           |
-| `--duration`     | `100` vocals / `150` music   | Song length in seconds                 |
+| `--duration`     | `150` (seconds, = 2:30)      | Song length                            |
 | `--steps`        | `60`                         | Diffusion steps. Lower = faster, lower quality |
 | `--guidance`     | `15.0`                       | Classifier-free guidance scale         |
 | `--precision`    | `float16`                    | `float16` (~7 GB RAM) or `float32` (~14 GB) |
-| `--with-music`   | off                          | Add the backing band. Default (off) = vocals only |
+| `--acapella`     | off                          | Vocals only — strip instruments with a Roformer model |
 | `--output`       | `happy_birthday_<name>.mp3`  | Output MP3 path                        |
 | `--no-cache`     | off                          | Skip the cache, always re-render       |
 | `--list-voices`  | —                            | Print profiles and exit                |
@@ -245,11 +209,11 @@ Other tips for high throughput:
 |------------------|---------------|---------------------------------------------|
 | `--names`        | required      | Path to a text file (one name per line)     |
 | `--out`          | required      | Output directory for MP3s                   |
-| `--duration`     | `100`/`150`   | Per-song length (vocals-only / with music)  |
+| `--duration`     | `150`         | Per-song length                             |
 | `--steps`        | `60`          | Diffusion steps                             |
 | `--guidance`     | `15.0`        | CFG scale                                   |
 | `--precision`    | `float16`     | `float16` (~7 GB RAM) or `float32` (~14 GB)  |
-| `--with-music`   | off           | Add the backing band. Default (off) = vocals only |
+| `--acapella`     | off           | Vocals only — strip instruments with a Roformer model |
 | `--retries`      | `1`           | Per-name retry count on failure             |
 | `--voice N`      | rotate        | Pin all renders to one voice                |
 | `--no-cache`     | off           | Always re-render                            |
@@ -274,7 +238,7 @@ birthdayVoiceOnly/
 │   ├── lyrics.py             Tagged lyrics builder
 │   ├── voice_profiles.py     4 female voice prompts + deterministic rotation
 │   ├── acestep_render.py     ACE-Step pipeline wrapper + cache
-│   └── vocal_isolate.py      Roformer isolation + pause tightening
+│   └── vocal_isolate.py      Roformer vocal-stem isolation (--acapella)
 │
 ├── external/
 │   └── ACE-Step/           Cloned by scripts/install_acestep.sh
@@ -284,7 +248,7 @@ birthdayVoiceOnly/
 │   └── smoke_test.py         30-s render to verify the install
 │
 ├── cache/acestep/          WAV cache, keyed by inputs hash
-├── tests/                  pytest unit tests (lyrics, voices, isolation)
+├── tests/                  pytest unit tests (lyrics, voice_profiles)
 └── venv-diffsinger/        Python 3.10 venv (despite the legacy name)
 ```
 
@@ -330,13 +294,9 @@ first real song.
   Mac with 16–18 GB RAM.
 - **Faster but rougher renders**: `--steps 30 --guidance 12`
 - **Slower but cleaner renders**: `--steps 90 --guidance 18`
-- **Different vocal style**: edit `song/voice_profiles.py` — each profile
-  is a vocalist descriptor + a base seed, expanded into two prompts (a
-  cappella and full-band). Re-render after editing invalidates the cache.
-- **Pause tightening**: the gap thresholds live at the top of
-  `song/vocal_isolate.py` (`_LONG_GAP_MS`, `_KEPT_GAP_MS`, `_EDGE_PAD_MS`)
-  — raise `_KEPT_GAP_MS` for more breathing room, lower it for a tighter
-  read.
+- **Different vocal style**: edit `song/voice_profiles.py` — each profile is
+  just a natural-language prompt + a base seed. Re-render after editing
+  invalidates the cache automatically.
 - **Different lyrics**: edit `_SONG_TEMPLATE` in `song/lyrics.py`. Keep the
   `[verse]` / `[bridge]` / `[chorus]` / `[outro]` tags — they're how
   ACE-Step understands song structure.
@@ -350,16 +310,15 @@ source venv-diffsinger/bin/activate
 pytest -v
 ```
 
-Tests cover lyrics building, voice rotation, and the vocal-isolation /
-pause-tightening helpers. The ACE-Step render path itself isn't
-unit-tested (it's a 4 GB neural network) and neither is Roformer
-separation — `scripts/smoke_test.py` serves as the integration test.
+Tests cover lyrics building and voice rotation. The ACE-Step render path
+itself isn't unit-tested (it's a 4 GB neural network) — `scripts/smoke_test.py`
+serves as the integration test.
 
 ---
 
 ## Credits
 
 - Music synthesis: [ACE-Step 1.5](https://github.com/ace-step/ACE-Step) by ACE Studio & StepFun AI (Apache 2.0)
-- Vocal isolation: [audio-separator](https://pypi.org/project/audio-separator/) with a BS-Roformer model (default vocals-only mode)
+- Vocal isolation: [audio-separator](https://pypi.org/project/audio-separator/) with a BS-Roformer model (`--acapella`)
 - Audio I/O: [pydub](https://github.com/jiaaro/pydub), [soundfile](https://github.com/bastibe/python-soundfile)
 - Apple Silicon acceleration: [PyTorch MPS](https://pytorch.org/docs/stable/notes/mps.html)
