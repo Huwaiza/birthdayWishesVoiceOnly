@@ -40,8 +40,8 @@ from pathlib import Path
 # BS-Roformer — a state-of-the-art vocal-separation model (SDR ~12.98).
 # Its weights (~200 MB) download once on first use into the cache dir below.
 # To try a different model, run `audio-separator --list_models` and swap
-# this string (the WAV cache for --acapella is keyed separately, so a model
-# change just means the next render re-isolates).
+# this string (then re-run with --no-cache so the new model re-isolates —
+# the isolated-vocal WAV is otherwise cached by filename).
 _ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 
 # Persist downloaded model weights here so they survive reboots — the
@@ -93,7 +93,8 @@ def isolate_vocals(
         from audio_separator.separator import Separator
     except ImportError as e:
         raise RuntimeError(
-            "audio-separator is not installed — it powers --acapella.\n"
+            "audio-separator is not installed — it powers the default "
+            "vocals-only mode.\n"
             "    pip install \"audio-separator[cpu]\""
         ) from e
 
@@ -174,3 +175,125 @@ def _pick_vocal_stem(outputs, work_dir: Path):
         if p.exists() and "instrumental" not in p.name.lower():
             return p
     return None
+
+
+# --- Pause tightening -------------------------------------------------------
+#
+# ACE-Step composes a song *arrangement*, so even an a cappella-prompted
+# render leaves some instrumental space — a short intro, fills between
+# sections, an outro. Once the backing is separated out, those stretches
+# become long silences. tighten_pauses() collapses them so the vocal-only
+# track is continuous and production-ready.
+
+# A silent stretch longer than this (ms) is treated as a leftover
+# instrumental gap and collapsed; anything shorter is natural phrasing
+# and is kept exactly as the singer performed it.
+_LONG_GAP_MS = 700
+# Collapsed gaps become this much silence — one natural breath.
+_KEPT_GAP_MS = 350
+# Leading / trailing silence is trimmed down to this small, even pad.
+_EDGE_PAD_MS = 150
+# A little audio kept on each side of a phrase so consonants at the
+# start/end of a line aren't clipped off.
+_PHRASE_PAD_MS = 60
+
+
+def _silence(ms, like):
+    """A silent AudioSegment matching another segment's audio format."""
+    from pydub import AudioSegment
+    seg = AudioSegment.silent(duration=ms, frame_rate=like.frame_rate)
+    return seg.set_channels(like.channels).set_sample_width(like.sample_width)
+
+
+def tighten_pauses(
+    input_wav: Path,
+    output_wav: Path,
+    verbose: bool = True,
+) -> Path:
+    """
+    Collapse the long silent gaps in an isolated-vocal WAV.
+
+    Detects silences longer than ~0.7 s — the ghosts of the instrumental
+    intro / fills / outro — and shrinks each to a single natural breath
+    (~0.35 s), then trims the silent head and tail. Short pauses are left
+    untouched, so the result still breathes like a real performance
+    instead of sounding rushed.
+
+    Parameters
+    ----------
+    input_wav : Path
+        Isolated-vocal WAV (the output of isolate_vocals()).
+    output_wav : Path
+        Where to write the tightened WAV.
+    verbose : bool
+        Print progress lines.
+
+    Returns
+    -------
+    Path to output_wav.
+
+    Raises
+    ------
+    FileNotFoundError
+        If input_wav does not exist.
+    """
+    input_wav = Path(input_wav)
+    output_wav = Path(output_wav)
+    if not input_wav.exists():
+        raise FileNotFoundError(f"input WAV not found: {input_wav}")
+
+    # pydub is a hard project dependency, but imported lazily so this
+    # module stays importable on its own (the unit tests rely on that).
+    from pydub import AudioSegment
+    from pydub.silence import detect_nonsilent
+
+    t0 = time.time()
+    audio = AudioSegment.from_wav(str(input_wav))
+    total_ms = len(audio)
+
+    # Threshold relative to the track's own loudness, so it adapts to
+    # whatever absolute level the separator produced.
+    silence_thresh = audio.dBFS - 16
+
+    # Only silences >= _LONG_GAP_MS split the audio; shorter pauses stay
+    # inside a non-silent run and are therefore preserved untouched.
+    nonsilent = detect_nonsilent(
+        audio,
+        min_silence_len=_LONG_GAP_MS,
+        silence_thresh=silence_thresh,
+        seek_step=10,
+    )
+
+    if not nonsilent:
+        # No singing detected (or the file is unexpectedly quiet) — copy
+        # it through untouched rather than emit an empty file.
+        output_wav.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(input_wav), str(output_wav))
+        if verbose:
+            print(f"[tighten_pauses] no audio detected — copied "
+                  f"{input_wav.name} unchanged")
+        return output_wav
+
+    kept_gap = _silence(_KEPT_GAP_MS, audio)
+    out = AudioSegment.empty()
+    for i, (start, end) in enumerate(nonsilent):
+        # Pad each phrase slightly so onsets/tails aren't clipped.
+        s = max(0, start - _PHRASE_PAD_MS)
+        e = min(total_ms, end + _PHRASE_PAD_MS)
+        if i > 0:
+            out += kept_gap
+        out += audio[s:e]
+
+    edge = _silence(_EDGE_PAD_MS, audio)
+    out = edge + out + edge
+
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    out.export(str(output_wav), format="wav")
+
+    dt = time.time() - t0
+    if verbose:
+        trimmed = (total_ms - len(out)) / 1000.0
+        print(f"[tighten_pauses] {len(nonsilent)} phrase group(s), "
+              f"{total_ms / 1000:.1f}s → {len(out) / 1000:.1f}s "
+              f"(removed {trimmed:.1f}s of gaps) in {dt:.0f}s")
+    return output_wav

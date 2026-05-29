@@ -2,18 +2,22 @@
 """
 Birthday Song Generator  v7  —  ACE-Step (local, free)
 ======================================================
-One name in → one ~2:30 personalised birthday song MP3 out.
-ACE-Step generates vocals + backing in a single pass on Apple Silicon
-(MPS auto-detected). 100% local, no API calls, free for unlimited renders.
+One name in → one personalised birthday song MP3 out.
 
-First run downloads ACE-Step weights (~4 GB) into ~/.cache/ace-step/checkpoints.
-Subsequent runs are cached.
+By default the song is VOCALS ONLY (a cappella): ACE-Step renders it,
+a Roformer model strips the backing, and the leftover gaps are
+tightened. Pass --with-music for the full vocals + backing band mix.
+
+ACE-Step runs locally on Apple Silicon (MPS auto-detected) — 100%
+local, no API calls, free for unlimited renders. First run downloads
+ACE-Step weights (~4 GB) into ~/.cache/ace-step/checkpoints; subsequent
+runs are cached.
 
 Usage
 -----
   python generate_birthday.py --name "Huwaiza"
   python generate_birthday.py --name "Sara" --voice 2
-  python generate_birthday.py --name "Adam" --duration 165
+  python generate_birthday.py --name "Adam" --with-music
   python generate_birthday.py --list-voices
 """
 
@@ -43,14 +47,15 @@ def main() -> None:
         EXAMPLES
           python generate_birthday.py --name "Huwaiza"
           python generate_birthday.py --name "Sara" --voice 2
-          python generate_birthday.py --name "Adam" --duration 165
+          python generate_birthday.py --name "Adam" --with-music
           python generate_birthday.py --list-voices
 
         NOTES
+          • Vocals only (a cappella) is the DEFAULT; --with-music adds the band.
           • First run downloads the ACE-Step model (~4 GB) into ~/.cache/ace-step.
           • Voices rotate deterministically by hash(name) across 4 profiles.
           •   --voice N pins a specific profile (0..3).
-          • Renders are cached — same (name, voice, lyrics) → instant return.
+          • Renders are cached — same (name, voice, mode, lyrics) → instant return.
           • Apple Silicon MPS is used automatically when available.
         """),
     )
@@ -58,8 +63,9 @@ def main() -> None:
                     help="Name to sing (required unless --list-voices)")
     ap.add_argument("--voice", type=int, default=None, metavar="N",
                     help="Pin voice profile 0..3 (default: hash(name) rotation)")
-    ap.add_argument("--duration", type=float, default=150.0,
-                    help="Target duration in seconds (default 150 = 2:30)")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="Target duration in seconds "
+                         "(default: 100 for vocals-only, 150 with --with-music)")
     ap.add_argument("--output", default=None,
                     help="Output MP3 path (default: happy_birthday_<name>.mp3)")
     ap.add_argument("--steps", type=int, default=60,
@@ -70,10 +76,12 @@ def main() -> None:
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use to ~14 GB; on Macs with "
                          "<=18 GB that causes disk swapping and very slow renders.")
-    ap.add_argument("--acapella", action="store_true",
-                    help="Vocals only: render the full song, then strip every "
-                         "instrument with a Roformer model "
-                         "(needs `pip install \"audio-separator[cpu]\"`)")
+    ap.add_argument("--with-music", action="store_true", dest="with_music",
+                    help="Render the full song WITH the backing band. The "
+                         "default (no flag) is vocals only: ACE-Step renders "
+                         "it, a Roformer model strips every instrument, and "
+                         "the leftover gaps are tightened "
+                         "(vocals-only needs `pip install \"audio-separator[cpu]\"`)")
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Force re-render even if cached")
     ap.add_argument("--list-voices", action="store_true", dest="list_voices",
@@ -88,7 +96,7 @@ def main() -> None:
         print("\nAvailable voice profiles:")
         for i, v in enumerate(VOICE_PROFILES):
             print(f"  [{i}] {v.name}")
-            for line in textwrap.wrap(v.prompt, width=72,
+            for line in textwrap.wrap(v.prompt_acapella, width=72,
                                       initial_indent="      ",
                                       subsequent_indent="      "):
                 print(line)
@@ -98,8 +106,12 @@ def main() -> None:
     if not args.name:
         ap.error("--name is required (or use --list-voices)")
 
+    # Vocals-only songs are naturally shorter; the band wants more room.
+    duration = args.duration if args.duration is not None else (
+        150.0 if args.with_music else 100.0)
+
     safe = args.name.lower().replace(" ", "_")
-    suffix = "_acapella" if args.acapella else ""
+    suffix = "_with_music" if args.with_music else ""
     output_mp3 = Path(args.output or f"happy_birthday_{safe}{suffix}.mp3")
     if not output_mp3.is_absolute():
         output_mp3 = SCRIPT_DIR / output_mp3
@@ -111,9 +123,9 @@ def main() -> None:
     print(f"  Name     : {args.name}")
     print(f"  Voice    : {chosen.name}"
           + (f"  (pinned)" if args.voice is not None else "  (auto-rotated)"))
-    print(f"  Duration : {args.duration:.0f}s")
+    print(f"  Duration : {duration:.0f}s")
     print(f"  Precision: {args.precision}")
-    print(f"  Mode     : {'a cappella — vocals only' if args.acapella else 'full song — vocals + backing'}")
+    print(f"  Mode     : {'full song — vocals + backing band' if args.with_music else 'vocals only — a cappella'}")
     print(f"  Started  : {started_at:%Y-%m-%d %H:%M:%S}")
     print(f"  Output   : {output_mp3}")
     print("=" * 60 + "\n")
@@ -122,25 +134,35 @@ def main() -> None:
     wav_path = render(
         name=args.name,
         voice_index=args.voice,
-        duration_s=args.duration,
+        duration_s=duration,
         infer_step=args.steps,
         guidance_scale=args.guidance,
         use_cache=not args.no_cache,
         verbose=True,
         precision=args.precision,
+        with_music=args.with_music,
     )
 
     print(f"\n[main] WAV ready: {wav_path}")
 
-    if args.acapella:
-        from song.vocal_isolate import isolate_vocals
+    if not args.with_music:
+        from song.vocal_isolate import isolate_vocals, tighten_pauses
+
         vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
         if vocals_wav.exists() and not args.no_cache:
             print(f"[main] cached vocal stem: {vocals_wav.name}")
         else:
             print(f"[main] Isolating vocals — removing all instruments...")
             isolate_vocals(wav_path, vocals_wav, verbose=True)
-        wav_path = vocals_wav
+
+        tight_wav = wav_path.with_name(wav_path.stem + "__vocal_tight.wav")
+        if tight_wav.exists() and not args.no_cache:
+            print(f"[main] cached tightened vocal: {tight_wav.name}")
+        else:
+            print(f"[main] Tightening pauses — collapsing instrumental gaps...")
+            tighten_pauses(vocals_wav, tight_wav, verbose=True)
+
+        wav_path = tight_wav
 
     print(f"[main] Encoding 192 kbps MP3 → {output_mp3}")
     _wav_to_mp3(wav_path, output_mp3)

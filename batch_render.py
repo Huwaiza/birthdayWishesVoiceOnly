@@ -4,12 +4,13 @@ batch_render.py — render birthday songs for a list of names.
 
 Reads a names file (one name per line, blank lines and #-comments ignored),
 renders each via ACE-Step, encodes to 192 kbps MP3, and writes to an output
-directory. Re-runs are nearly free thanks to the WAV cache.
+directory. Songs are vocals-only by default (a cappella); pass --with-music
+for the full backing band. Re-runs are nearly free thanks to the WAV cache.
 
 Usage
 -----
   python batch_render.py --names names.txt --out output/
-  python batch_render.py --names names.txt --out output/ --duration 150
+  python batch_render.py --names names.txt --out output/ --with-music
   python batch_render.py --names names.txt --out output/ --retries 2
 
 The model loads once and is reused across the whole batch — overhead is
@@ -45,8 +46,9 @@ def main() -> None:
                     help="Path to names.txt (one name per line)")
     ap.add_argument("--out", required=True, type=Path,
                     help="Output directory for MP3s")
-    ap.add_argument("--duration", type=float, default=150.0,
-                    help="Target duration per song in seconds (default 150)")
+    ap.add_argument("--duration", type=float, default=None,
+                    help="Target duration per song in seconds "
+                         "(default: 100 for vocals-only, 150 with --with-music)")
     ap.add_argument("--steps", type=int, default=60,
                     help="ACE-Step inference steps (default 60)")
     ap.add_argument("--guidance", type=float, default=15.0,
@@ -55,10 +57,12 @@ def main() -> None:
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use; on Macs with <=18 GB that "
                          "causes disk swapping and very slow renders.")
-    ap.add_argument("--acapella", action="store_true",
-                    help="Vocals only: strip every instrument with a Roformer "
-                         "model after each render "
-                         "(needs `pip install \"audio-separator[cpu]\"`)")
+    ap.add_argument("--with-music", action="store_true", dest="with_music",
+                    help="Render the full song WITH the backing band. The "
+                         "default (no flag) is vocals only: every instrument "
+                         "is stripped with a Roformer model and the leftover "
+                         "gaps tightened "
+                         "(vocals-only needs `pip install \"audio-separator[cpu]\"`)")
     ap.add_argument("--retries", type=int, default=1,
                     help="Per-name retry count on failure (default 1)")
     ap.add_argument("--voice", type=int, default=None,
@@ -77,6 +81,10 @@ def main() -> None:
     if args.limit:
         names = names[:args.limit]
 
+    # Vocals-only songs are naturally shorter; the band wants more room.
+    duration = args.duration if args.duration is not None else (
+        150.0 if args.with_music else 100.0)
+
     args.out.mkdir(parents=True, exist_ok=True)
 
     batch_started = datetime.now()
@@ -84,9 +92,9 @@ def main() -> None:
     print("  Batch Birthday Song Render")
     print(f"  Names    : {len(names)} (file: {args.names})")
     print(f"  Output   : {args.out}")
-    print(f"  Duration : {args.duration:.0f}s   Steps: {args.steps}   CFG: {args.guidance}")
+    print(f"  Duration : {duration:.0f}s   Steps: {args.steps}   CFG: {args.guidance}")
     print(f"  Precision: {args.precision}")
-    print(f"  Mode     : {'a cappella — vocals only' if args.acapella else 'full song — vocals + backing'}")
+    print(f"  Mode     : {'full song — vocals + backing band' if args.with_music else 'vocals only — a cappella'}")
     print(f"  Voice    : {'index ' + str(args.voice) + ' (pinned)' if args.voice is not None else 'auto-rotated'}")
     print(f"  Started  : {batch_started:%Y-%m-%d %H:%M:%S}")
     print("=" * 60 + "\n")
@@ -95,15 +103,15 @@ def main() -> None:
     from song.acestep_render import render, format_duration
     from song.voice_profiles import pick_voice
     from pydub import AudioSegment
-    if args.acapella:
-        from song.vocal_isolate import isolate_vocals
+    if not args.with_music:
+        from song.vocal_isolate import isolate_vocals, tighten_pauses
 
     t_batch = time.time()
     succeeded, failed, cached = [], [], []
 
     for i, name in enumerate(names, start=1):
         safe = name.lower().replace(" ", "_").replace("/", "_")
-        mp3_suffix = "_acapella" if args.acapella else ""
+        mp3_suffix = "_with_music" if args.with_music else ""
         mp3_path = args.out / f"happy_birthday_{safe}{mp3_suffix}.mp3"
         chosen = pick_voice(name, override_index=args.voice)
 
@@ -120,22 +128,26 @@ def main() -> None:
                 wav_path = render(
                     name=name,
                     voice_index=args.voice,
-                    duration_s=args.duration,
+                    duration_s=duration,
                     infer_step=args.steps,
                     guidance_scale=args.guidance,
                     use_cache=not args.no_cache,
                     verbose=False,
                     precision=args.precision,
+                    with_music=args.with_music,
                 )
                 # Validate the WAV is non-empty
                 if wav_path.stat().st_size < 50_000:
                     raise RuntimeError(f"WAV looks too small: {wav_path.stat().st_size} bytes")
 
-                if args.acapella:
+                if not args.with_music:
                     vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
                     if not (vocals_wav.exists() and not args.no_cache):
                         isolate_vocals(wav_path, vocals_wav, verbose=False)
-                    wav_path = vocals_wav
+                    tight_wav = wav_path.with_name(wav_path.stem + "__vocal_tight.wav")
+                    if not (tight_wav.exists() and not args.no_cache):
+                        tighten_pauses(vocals_wav, tight_wav, verbose=False)
+                    wav_path = tight_wav
 
                 AudioSegment.from_wav(str(wav_path)).export(
                     str(mp3_path), format="mp3", bitrate="192k"
