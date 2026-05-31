@@ -1,0 +1,9 @@
+# Extra deps for the HTTP service, on top of the main requirements.txt
+# (numpy, pydub, audio-separator, + ACE-Step). Install into the SAME venv
+# that already has ACE-Step:
+#
+#   pip install -r service/requirements.txt
+#
+fastapi
+uvicorn[standard]
+httpx          # used by fastapi's TestClient in the service tests

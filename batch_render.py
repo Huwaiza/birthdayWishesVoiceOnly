@@ -4,12 +4,13 @@ batch_render.py — render birthday songs for a list of names.
 
 Reads a names file (one name per line, blank lines and #-comments ignored),
 renders each via ACE-Step, encodes to 192 kbps MP3, and writes to an output
-directory. Re-runs are nearly free thanks to the WAV cache.
+directory. Songs are vocals-only (a cappella) by DEFAULT; pass --with-music
+for the full backing band. Re-runs are nearly free thanks to the WAV cache.
 
 Usage
 -----
   python batch_render.py --names names.txt --out output/
-  python batch_render.py --names names.txt --out output/ --duration 150
+  python batch_render.py --names names.txt --out output/ --with-music
   python batch_render.py --names names.txt --out output/ --retries 2
 
 The model loads once and is reused across the whole batch — overhead is
@@ -55,10 +56,11 @@ def main() -> None:
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use; on Macs with <=18 GB that "
                          "causes disk swapping and very slow renders.")
-    ap.add_argument("--acapella", action="store_true",
-                    help="Vocals only: strip every instrument with a Roformer "
-                         "model after each render "
-                         "(needs `pip install \"audio-separator[cpu]\"`)")
+    ap.add_argument("--with-music", action="store_true", dest="with_music",
+                    help="Keep the backing band. The DEFAULT is vocals only: "
+                         "strip every instrument with a Roformer model after "
+                         "each render, then tighten the long silent gaps "
+                         "(vocals-only needs `pip install \"audio-separator[cpu]\"`)")
     ap.add_argument("--retries", type=int, default=1,
                     help="Per-name retry count on failure (default 1)")
     ap.add_argument("--voice", type=int, default=None,
@@ -86,7 +88,7 @@ def main() -> None:
     print(f"  Output   : {args.out}")
     print(f"  Duration : {args.duration:.0f}s   Steps: {args.steps}   CFG: {args.guidance}")
     print(f"  Precision: {args.precision}")
-    print(f"  Mode     : {'a cappella — vocals only' if args.acapella else 'full song — vocals + backing'}")
+    print(f"  Mode     : {'full song — vocals + backing' if args.with_music else 'a cappella — vocals only (default)'}")
     print(f"  Voice    : {'index ' + str(args.voice) + ' (pinned)' if args.voice is not None else 'auto-rotated'}")
     print(f"  Started  : {batch_started:%Y-%m-%d %H:%M:%S}")
     print("=" * 60 + "\n")
@@ -95,7 +97,7 @@ def main() -> None:
     from song.acestep_render import render, format_duration
     from song.voice_profiles import pick_voice
     from pydub import AudioSegment
-    if args.acapella:
+    if not args.with_music:
         from song.vocal_isolate import isolate_vocals, tighten_pauses
 
     t_batch = time.time()
@@ -103,7 +105,7 @@ def main() -> None:
 
     for i, name in enumerate(names, start=1):
         safe = name.lower().replace(" ", "_").replace("/", "_")
-        mp3_suffix = "_acapella" if args.acapella else ""
+        mp3_suffix = "_with_music" if args.with_music else ""
         mp3_path = args.out / f"happy_birthday_{safe}{mp3_suffix}.mp3"
         chosen = pick_voice(name, override_index=args.voice)
 
@@ -131,7 +133,7 @@ def main() -> None:
                 if wav_path.stat().st_size < 50_000:
                     raise RuntimeError(f"WAV looks too small: {wav_path.stat().st_size} bytes")
 
-                if args.acapella:
+                if not args.with_music:
                     vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
                     if not (vocals_wav.exists() and not args.no_cache):
                         isolate_vocals(wav_path, vocals_wav, verbose=False)

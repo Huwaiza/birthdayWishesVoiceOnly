@@ -16,11 +16,14 @@ After the one-time install (see below), this is your daily workflow:
 ```bash
 source venv-diffsinger/bin/activate
 
-# One song
+# One song (vocals only — the default)
 python generate_birthday.py --name "Huwaiza"
 
 # A batch
 python batch_render.py --names names.txt --out output/
+
+# Keep the backing band instead
+python generate_birthday.py --name "Huwaiza" --with-music
 ```
 
 Once the model is loaded, a 2:30 song renders in roughly 5–10 minutes on
@@ -60,12 +63,18 @@ song/acestep_render.py    → Calls ACE-Step with prompt + lyrics + seed,
                             caches the WAV by hash(everything).
     │
     ▼
+song/vocal_isolate.py     → DEFAULT (vocals only): a Roformer model strips
+                            every instrument, then tighten_pauses() collapses
+                            the long silent gaps the backing left behind.
+                            (Skipped with --with-music.)
+    │
+    ▼
 generate_birthday.py      → Encodes the WAV to a 192 kbps MP3.
 ```
 
-That's the whole thing. No backing-track loops, no separate vocal/mix
-stages, no MIDI authoring — ACE-Step composes melody, sings it, and mixes
-the band on every render.
+ACE-Step composes the melody, sings it, and mixes the band in one pass; by
+default we then lift just the vocal back out and tidy the gaps, so the
+finished song is a clean a cappella. Add `--with-music` to keep the band.
 
 ---
 
@@ -99,28 +108,32 @@ done
 
 ---
 
-## A cappella (vocals only)
+## A cappella (vocals only) — the default
 
-ACE-Step always renders a full mix — the voice plus a backing band. To get
-an instrument-free version, pass `--acapella`:
+By default the finished song is **vocals only**. ACE-Step still renders a
+full mix (voice + backing band), then two post-steps run automatically:
 
 ```bash
-python generate_birthday.py --name "Huwaiza" --acapella
-python batch_render.py --names names.txt --out output/ --acapella
+python generate_birthday.py --name "Huwaiza"               # vocals only (default)
+python batch_render.py --names names.txt --out output/     # vocals only (default)
+
+python generate_birthday.py --name "Huwaiza" --with-music  # keep the band
 ```
 
-This renders the full song as usual, then runs the result through a
-**Roformer** vocal-separation model (via
-[audio-separator](https://pypi.org/project/audio-separator/)) and keeps
-only the vocal stem. Roformer is the current state of the art for vocal
-isolation — it physically pulls the recording apart into stems, so the
-result is instrument-free for real, unlike just prompting for "a cappella"
-(which a generative model may not honour). It also doesn't leak an
-instrumental intro/outro into the vocal stem the way older models do.
+**1. Isolate** — the full mix goes through a **Roformer** vocal-separation
+model (via [audio-separator](https://pypi.org/project/audio-separator/)),
+keeping only the vocal stem. Roformer is the current state of the art: it
+physically pulls the recording apart into stems, so the result is
+instrument-free for real — far cleaner than prompting ACE-Step for "a
+cappella" (which a generative model may not honour, and which actually
+*degrades* the separation by starving it of a real mix to work on). One
+pass is deliberate; a second would add a faint watery artefact to the voice.
 
-One pass is deliberate: a second "cleanup" pass would scrub a touch more
-residue but start adding a faint, watery artefact to the voice itself —
-not worth it when the goal is a pristine vocal.
+**2. Tighten pauses** — isolating the vocal leaves long silences where the
+instrumental intro/fills/outro used to be. `tighten_pauses()` collapses only
+those long gaps (≥1 s) down to a natural breath, leaving every sung note and
+short pause untouched, so the song stops dragging without ever clipping the
+melody.
 
 Trade-offs:
 
@@ -129,12 +142,11 @@ Trade-offs:
   install via `scripts/install_acestep.sh` already includes it (it's in
   `requirements.txt`). The Roformer model (~200 MB) downloads once, on
   first use, into `~/.cache/audio-separator-models/`.
-- Output goes to `happy_birthday_<name>_acapella.mp3`, so it never
-  overwrites the full-song version.
+- The full-song version (`--with-music`) goes to
+  `happy_birthday_<name>_with_music.mp3`, so the two never overwrite.
 
-The isolated-vocal WAV is cached alongside the full render, so re-running
-`--acapella` for the same name is instant. Force a re-separation with
-`--no-cache`.
+The isolated and tightened WAVs are cached alongside the full render, so
+re-running the same name is instant. Force a re-render with `--no-cache`.
 
 ---
 
@@ -145,6 +157,54 @@ Rendered WAVs are cached in `cache/acestep/`. The cache key is a hash of
 calling the same name + voice twice is instant; tweaking the lyrics or a
 voice prompt invalidates everyone correctly. Force a re-render with
 `--no-cache`.
+
+---
+
+## Running as a service (HTTP)
+
+For on-demand use from another local process, run the bundled HTTP service.
+It keeps the model loaded once, renders one song at a time, and writes the
+finished MP3 to a shared folder another process can read directly.
+
+```bash
+# Install the extra deps (into the same venv that has ACE-Step), once:
+pip install -r service/requirements.txt
+
+# Start it (one worker = model loaded once; renders are serialized):
+uvicorn service.app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Because a render takes minutes, the API is **submit-then-poll** — you never
+hold a long request open:
+
+| Method & path           | Purpose                                                            |
+| ----------------------- | ------------------------------------------------------------------ |
+| `GET  /health`          | `{status, model_ready, queued_or_running}`                         |
+| `POST /jobs`            | Submit `{name, voice?, duration?}` → `{job_id, status, mp3_path?}` |
+| `GET  /jobs/{job_id}`   | Poll → `{status, mp3_path, error, ...}`                            |
+| `GET  /jobs/{job_id}/audio` | Optional: stream the MP3 over HTTP (not needed locally)        |
+
+`status` moves `queued → running → done` (or `error`). When `done`,
+`mp3_path` is the absolute path of the finished file.
+
+**Where files land.** Finished MP3s are written to `output/` (override with
+the `BIRTHDAY_OUTPUT_DIR` env var) as `happy_birthday_<name>.mp3`. The folder
+is created automatically. Intermediate WAVs reuse the normal `cache/acestep/`
+cache, so re-requesting a name returns instantly.
+
+**Idempotent & crash-safe.** Submitting the same `(name, voice, duration)`
+twice returns the same job; if the MP3 already exists (even after a restart),
+the service reports `done` without re-rendering.
+
+```bash
+# Submit a song, then poll until it's done:
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+     -d '{"name": "Mujtaba"}'
+# → {"job_id":"ab12cd34ef56","status":"queued","mp3_path":null,...}
+
+curl -s localhost:8000/jobs/ab12cd34ef56
+# → {"status":"done","mp3_path":".../output/happy_birthday_mujtaba.mp3",...}
+```
 
 ---
 
@@ -198,7 +258,7 @@ Other tips for high throughput:
 | `--steps`        | `60`                         | Diffusion steps. Lower = faster, lower quality |
 | `--guidance`     | `15.0`                       | Classifier-free guidance scale         |
 | `--precision`    | `float16`                    | `float16` (~7 GB RAM) or `float32` (~14 GB) |
-| `--acapella`     | off                          | Vocals only — strip instruments with a Roformer model |
+| `--with-music`   | off                          | Keep the backing band (default is vocals only) |
 | `--output`       | `happy_birthday_<name>.mp3`  | Output MP3 path                        |
 | `--no-cache`     | off                          | Skip the cache, always re-render       |
 | `--list-voices`  | —                            | Print profiles and exit                |
@@ -213,7 +273,7 @@ Other tips for high throughput:
 | `--steps`        | `60`          | Diffusion steps                             |
 | `--guidance`     | `15.0`        | CFG scale                                   |
 | `--precision`    | `float16`     | `float16` (~7 GB RAM) or `float32` (~14 GB)  |
-| `--acapella`     | off           | Vocals only — strip instruments with a Roformer model |
+| `--with-music`   | off           | Keep the backing band (default is vocals only) |
 | `--retries`      | `1`           | Per-name retry count on failure             |
 | `--voice N`      | rotate        | Pin all renders to one voice                |
 | `--no-cache`     | off           | Always re-render                            |
@@ -238,7 +298,11 @@ birthdayVoiceOnly/
 │   ├── lyrics.py             Tagged lyrics builder
 │   ├── voice_profiles.py     4 female voice prompts + deterministic rotation
 │   ├── acestep_render.py     ACE-Step pipeline wrapper + cache
-│   └── vocal_isolate.py      Roformer vocal-stem isolation (--acapella)
+│   └── vocal_isolate.py      Roformer vocal-stem isolation + pause tightening
+│
+├── service/                HTTP service (see "Running as a service")
+│   ├── app.py                FastAPI app — submit/poll jobs, warm model
+│   └── requirements.txt      fastapi + uvicorn (on top of the main deps)
 │
 ├── external/
 │   └── ACE-Step/           Cloned by scripts/install_acestep.sh
@@ -310,7 +374,9 @@ source venv-diffsinger/bin/activate
 pytest -v
 ```
 
-Tests cover lyrics building and voice rotation. The ACE-Step render path
+Tests cover lyrics building, voice rotation, pause tightening
+(`test_tighten_pauses.py`, synthetic audio — no model), and the HTTP service
+(`test_service.py`, with the model + render mocked). The ACE-Step render path
 itself isn't unit-tested (it's a 4 GB neural network) — `scripts/smoke_test.py`
 serves as the integration test.
 
@@ -319,6 +385,6 @@ serves as the integration test.
 ## Credits
 
 - Music synthesis: [ACE-Step 1.5](https://github.com/ace-step/ACE-Step) by ACE Studio & StepFun AI (Apache 2.0)
-- Vocal isolation: [audio-separator](https://pypi.org/project/audio-separator/) with a BS-Roformer model (`--acapella`)
+- Vocal isolation: [audio-separator](https://pypi.org/project/audio-separator/) with a BS-Roformer model (default vocals-only mode)
 - Audio I/O: [pydub](https://github.com/jiaaro/pydub), [soundfile](https://github.com/bastibe/python-soundfile)
 - Apple Silicon acceleration: [PyTorch MPS](https://pytorch.org/docs/stable/notes/mps.html)
