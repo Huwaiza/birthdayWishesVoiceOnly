@@ -32,6 +32,7 @@ serialized through this service's own queue.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import queue
@@ -61,6 +62,36 @@ OUTPUT_DIR = Path(os.environ.get("BIRTHDAY_OUTPUT_DIR", _REPO_ROOT / "output"))
 # Render defaults — match the CLI so service output == `--acapella` output.
 DEFAULT_DURATION_S = 150.0
 
+# --- Render watchdog --------------------------------------------------------
+# A single worker renders jobs one at a time, and a render is a heavy in-process
+# model call with no built-in timeout. If one hangs (model deadlock, resource
+# exhaustion) the worker is wedged forever and every queued job behind it
+# starves — the caller just polls "running" until it times out. The watchdog
+# bounds that: any job rendering longer than RENDER_HARD_LIMIT_S is force-failed
+# so the caller gets a clean error and can retry / self-heal. Normal renders are
+# ~8-9 min; the 25-min default leaves generous headroom for a slow (not hung)
+# render to still finish on its own.
+RENDER_HARD_LIMIT_S = float(os.environ.get("RENDER_HARD_LIMIT_S", "1500"))
+_WATCHDOG_INTERVAL_S = float(os.environ.get("RENDER_WATCHDOG_INTERVAL_S", "10"))
+# The wedged worker THREAD can't be killed in-process. Set this (only when the
+# service runs under a process supervisor that restarts it) to also exit on a
+# hang, so a fresh process reloads the model and drains the backed-up queue.
+_WATCHDOG_HARD_RESTART = os.environ.get("RENDER_WATCHDOG_HARD_RESTART", "0") == "1"
+
+# --- Proactive recycle ------------------------------------------------------
+# Memory pressure accumulates across renders (MPS/RAM the allocator never hands
+# back), which is what eventually swaps a render into a multi-hour/hung one.
+# _free_render_memory() after every job is the primary mitigation. As a belt-
+# and-suspenders guarantee of a clean slate, the service can also recycle itself
+# after this many completed jobs: it exits cleanly once the queue is idle so a
+# supervisor (run_service.sh) respawns a fresh process. 0 = disabled (so a bare
+# `uvicorn` never quits unexpectedly); the supervisor wrapper sets it.
+RENDER_RESTART_AFTER_JOBS = int(os.environ.get("RENDER_RESTART_AFTER_JOBS", "0"))
+# Grace period before a recycle exit, so a client polling for the last job's
+# "done" sees it before the process goes down. Must exceed the client poll
+# interval (~15s).
+_RESTART_GRACE_S = float(os.environ.get("RENDER_RESTART_GRACE_S", "20"))
+
 
 # --- Job bookkeeping --------------------------------------------------------
 
@@ -75,11 +106,15 @@ class Job:
     error: Optional[str] = None
     submitted_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     finished_at: Optional[str] = None
+    render_started_at: Optional[float] = None   # monotonic-ish wall clock; set when status→running
 
 
 _JOBS: dict[str, Job] = {}
 _JOBS_LOCK = threading.Lock()
 _WORK_QUEUE: "queue.Queue[str]" = queue.Queue()
+
+# Count of jobs this process has finished (done or error), for the recycle gate.
+_JOBS_COMPLETED = 0
 
 # Set once the ACE-Step model has finished loading.
 _MODEL_READY = threading.Event()
@@ -153,8 +188,38 @@ def _warm_model() -> None:
         _MODEL_READY.set()
 
 
+def _free_render_memory() -> None:
+    """Release per-render memory back to the OS after every job. Without this
+    the MPS/CUDA caching allocator holds onto each render's working set, so
+    pressure only climbs across a session until a render swaps and hangs — the
+    exact failure documented in song/acestep_render.py. The model singletons are
+    NOT touched (we only drop intermediates + the per-call separator)."""
+    gc.collect()
+    try:
+        import torch
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available() and hasattr(torch, "mps"):
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — best-effort; torch may be absent in tests
+        pass
+
+
+def _restart_due() -> bool:
+    """True when the process has finished enough jobs to warrant a clean restart
+    AND nothing is waiting — so recycling won't drop a queued render. No-op
+    unless RENDER_RESTART_AFTER_JOBS > 0 (set only by the supervisor wrapper)."""
+    if RENDER_RESTART_AFTER_JOBS <= 0:
+        return False
+    with _JOBS_LOCK:
+        completed = _JOBS_COMPLETED
+    return completed >= RENDER_RESTART_AFTER_JOBS and _WORK_QUEUE.empty()
+
+
 def _worker() -> None:
     """Single consumer — pulls one job at a time and runs it to completion."""
+    global _JOBS_COMPLETED
     while True:
         job_id = _WORK_QUEUE.get()
         with _JOBS_LOCK:
@@ -165,22 +230,72 @@ def _worker() -> None:
         try:
             with _JOBS_LOCK:
                 job.status = "running"
+                job.render_started_at = time.time()
             print(f"[service] rendering job {job_id} ({job.name})")
             t0 = time.time()
             mp3 = _generate(job)
             with _JOBS_LOCK:
-                job.status = "done"
-                job.mp3_path = str(mp3)
-                job.finished_at = datetime.now().isoformat(timespec="seconds")
+                # The watchdog may have force-failed this job for running too
+                # long; don't resurrect it to "done" (the caller has moved on).
+                # The MP3 is still written to disk, so a later run picks it up.
+                if job.status == "running":
+                    job.status = "done"
+                    job.mp3_path = str(mp3)
+                    job.finished_at = datetime.now().isoformat(timespec="seconds")
             print(f"[service] job {job_id} done in {time.time() - t0:.0f}s → {mp3}")
         except Exception as e:  # noqa: BLE001 — report failure, keep serving
             with _JOBS_LOCK:
-                job.status = "error"
-                job.error = str(e)
-                job.finished_at = datetime.now().isoformat(timespec="seconds")
+                if job.status == "running":
+                    job.status = "error"
+                    job.error = str(e)
+                    job.finished_at = datetime.now().isoformat(timespec="seconds")
             print(f"[service] job {job_id} FAILED: {e}")
         finally:
             _WORK_QUEUE.task_done()
+            _free_render_memory()
+            with _JOBS_LOCK:
+                _JOBS_COMPLETED += 1
+
+        # Recycle to a fresh process once we've done enough jobs and the queue
+        # has drained — keeps long sessions from accumulating into a hung render.
+        if _restart_due():
+            print(f"[service] recycling after {_JOBS_COMPLETED} jobs to reset "
+                  f"memory; supervisor will respawn a clean process.")
+            time.sleep(_RESTART_GRACE_S)   # let a poller fetch the last 'done'
+            if _WORK_QUEUE.empty():
+                os._exit(0)
+
+
+def _watchdog_sweep(now: float) -> list[str]:
+    """Force-fail any job that has been rendering longer than
+    RENDER_HARD_LIMIT_S. Returns the ids it failed. Kept free of sleeping and
+    threads so the policy is unit-testable in isolation."""
+    wedged: list[str] = []
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if (job.status == "running" and job.render_started_at is not None
+                    and now - job.render_started_at > RENDER_HARD_LIMIT_S):
+                job.status = "error"
+                job.error = (
+                    f"render exceeded hard limit ({RENDER_HARD_LIMIT_S:.0f}s); "
+                    "worker wedged — caller should retry; service may need restart"
+                )
+                job.finished_at = datetime.now().isoformat(timespec="seconds")
+                wedged.append(job.job_id)
+    return wedged
+
+
+def _watchdog() -> None:
+    """Periodically sweep for renders that have hung past the hard limit."""
+    while True:
+        time.sleep(_WATCHDOG_INTERVAL_S)
+        for job_id in _watchdog_sweep(time.time()):
+            print(f"[service] WATCHDOG force-failed job {job_id} "
+                  f"(> {RENDER_HARD_LIMIT_S:.0f}s).")
+            if _WATCHDOG_HARD_RESTART:
+                print("[service] WATCHDOG hard-restart: exiting so a supervisor "
+                      "respawns a clean worker and drains the queue.")
+                os._exit(1)
 
 
 @asynccontextmanager
@@ -190,6 +305,7 @@ async def lifespan(app: FastAPI):
     if not _BG_STARTED:
         threading.Thread(target=_warm_model, name="model-warmer", daemon=True).start()
         threading.Thread(target=_worker, name="render-worker", daemon=True).start()
+        threading.Thread(target=_watchdog, name="render-watchdog", daemon=True).start()
         _BG_STARTED = True
     yield
 

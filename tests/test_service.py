@@ -146,6 +146,91 @@ def test_render_error_is_reported(svc):
     assert "render exploded" in done["error"]
 
 
+def test_watchdog_force_fails_a_render_past_the_hard_limit(svc, monkeypatch):
+    """A render that has been 'running' longer than RENDER_HARD_LIMIT_S is
+    force-failed so the caller gets a clean error instead of polling forever."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_HARD_LIMIT_S", 100.0)
+
+    job = module.Job(job_id="wedged1", name="Wedge", voice=None, duration=1.0,
+                     status="running")
+    job.render_started_at = time.time() - 250.0  # started well past the limit
+    with module._JOBS_LOCK:
+        module._JOBS[job.job_id] = job
+
+    failed = module._watchdog_sweep(time.time())
+
+    assert "wedged1" in failed
+    assert module._JOBS["wedged1"].status == "error"
+    assert "hard limit" in (module._JOBS["wedged1"].error or "")
+
+
+def test_watchdog_leaves_a_fresh_render_running(svc, monkeypatch):
+    """A render still within the limit must NOT be touched by the watchdog."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_HARD_LIMIT_S", 100.0)
+
+    job = module.Job(job_id="fresh1", name="Fresh", voice=None, duration=1.0,
+                     status="running")
+    job.render_started_at = time.time() - 5.0  # well within the limit
+    with module._JOBS_LOCK:
+        module._JOBS[job.job_id] = job
+
+    failed = module._watchdog_sweep(time.time())
+
+    assert "fresh1" not in failed
+    assert module._JOBS["fresh1"].status == "running"
+
+
+def test_free_render_memory_is_safe_to_call(svc):
+    """The between-jobs memory release must never raise (torch may be absent)."""
+    client, module = svc
+    module._free_render_memory()  # should be a no-op-safe call
+
+
+def test_restart_disabled_by_default(svc, monkeypatch):
+    """With RENDER_RESTART_AFTER_JOBS=0 the service never recycles itself, no
+    matter how many jobs it has done — a bare uvicorn must not quit unexpectedly."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_RESTART_AFTER_JOBS", 0)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 9999)
+    assert module._restart_due() is False
+
+
+def test_restart_due_when_threshold_reached_and_idle(svc, monkeypatch):
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_RESTART_AFTER_JOBS", 10)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 10)
+    # Drain the queue so the recycle is safe (won't drop a pending render).
+    while not module._WORK_QUEUE.empty():
+        module._WORK_QUEUE.get_nowait()
+    assert module._restart_due() is True
+
+
+def test_restart_not_due_while_a_job_is_queued(svc, monkeypatch):
+    """Even past the threshold, don't recycle while work is pending."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_RESTART_AFTER_JOBS", 10)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 50)
+    module._WORK_QUEUE.put("pending-job")
+    try:
+        assert module._restart_due() is False
+    finally:
+        module._WORK_QUEUE.get_nowait()  # leave the queue clean for other tests
+
+
+def test_completed_counter_increments_after_a_job(svc):
+    client, module = svc
+    before = module._JOBS_COMPLETED
+    job_id = client.post("/jobs", json={"name": "Counted"}).json()["job_id"]
+    _poll(client, job_id)
+    # The counter bumps in the worker's finally, just after status flips to done.
+    deadline = time.time() + 2.0
+    while module._JOBS_COMPLETED <= before and time.time() < deadline:
+        time.sleep(0.02)
+    assert module._JOBS_COMPLETED > before
+
+
 def test_audio_endpoint(svc):
     client, module = svc
     # Not-done job → 409.
