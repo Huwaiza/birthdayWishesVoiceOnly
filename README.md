@@ -180,21 +180,31 @@ hold a long request open:
 | Method & path           | Purpose                                                            |
 | ----------------------- | ------------------------------------------------------------------ |
 | `GET  /health`          | `{status, model_ready, queued_or_running}`                         |
-| `POST /jobs`            | Submit `{name, voice?, duration?}` → `{job_id, status, mp3_path?}` |
+| `POST /jobs`            | Submit `{name, voice?, duration?, lyrics?, slug?}` → `{job_id, status, mp3_path?}` |
 | `GET  /jobs/{job_id}`   | Poll → `{status, mp3_path, error, ...}`                            |
 | `GET  /jobs/{job_id}/audio` | Optional: stream the MP3 over HTTP (not needed locally)        |
 
 `status` moves `queued → running → done` (or `error`). When `done`,
 `mp3_path` is the absolute path of the finished file.
 
-**Where files land.** Finished MP3s are written to `output/` (override with
-the `BIRTHDAY_OUTPUT_DIR` env var) as `happy_birthday_<name>.mp3`. The folder
-is created automatically. Intermediate WAVs reuse the normal `cache/acestep/`
-cache, so re-requesting a name returns instantly.
+**Custom (non-birthday) songs.** `lyrics` and `slug` are optional. Pass
+`lyrics` (a full ACE-Step `[verse]/[bridge]/[chorus]/[outro]` blob) to render
+something other than the birthday template — when omitted, the service builds
+the birthday lyrics from `name` exactly as before. Pass `slug` to write the
+output as `<slug>.mp3` instead of `happy_birthday_<name>.mp3`, so a custom song
+never collides with a real person's birthday of the same name. These power the
+`generate_custom_video` campaign command in the `birthdaygen` repo.
 
-**Idempotent & crash-safe.** Submitting the same `(name, voice, duration)`
-twice returns the same job; if the MP3 already exists (even after a restart),
-the service reports `done` without re-rendering.
+**Where files land.** Finished MP3s are written to `output/` (override with
+the `BIRTHDAY_OUTPUT_DIR` env var) as `happy_birthday_<name>.mp3` — or
+`<slug>.mp3` when a `slug` is given. The folder is created automatically.
+Intermediate WAVs reuse the normal `cache/acestep/` cache, so re-requesting the
+same parameters returns instantly.
+
+**Idempotent & crash-safe.** Submitting the same
+`(name, voice, duration, lyrics, slug)` twice returns the same job; if the MP3
+already exists (even after a restart), the service reports `done` without
+re-rendering.
 
 ```bash
 # Submit a song, then poll until it's done:
