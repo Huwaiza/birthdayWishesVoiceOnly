@@ -101,6 +101,8 @@ class Job:
     name: str
     voice: Optional[int]
     duration: float
+    lyrics: Optional[str] = None
+    slug: Optional[str] = None
     status: str = "queued"          # queued → running → done | error
     mp3_path: Optional[str] = None
     error: Optional[str] = None
@@ -129,18 +131,21 @@ def _safe_name(name: str) -> str:
     return name.strip().lower().replace(" ", "_").replace("/", "_")
 
 
-def _job_id(name: str, voice: Optional[int], duration: float) -> str:
+def _job_id(name: str, voice: Optional[int], duration: float,
+            lyrics: Optional[str] = None, slug: Optional[str] = None) -> str:
     """Deterministic id from the render parameters, so re-submitting the
     same request dedupes onto the same job instead of rendering twice."""
-    key = f"{_safe_name(name)}|{voice}|{duration:.1f}"
+    lyrics_key = hashlib.md5(lyrics.encode("utf-8")).hexdigest() if lyrics else ""
+    key = f"{_safe_name(name)}|{voice}|{duration:.1f}|{slug or ''}|{lyrics_key}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
 
-def _mp3_path_for(name: str) -> Path:
-    """Predictable, username-based output path — what the video step picks
-    up. Note: voice/duration are NOT in the filename, so changing those for
-    the same name overwrites the previous MP3 (fine for one-song-per-user)."""
-    return OUTPUT_DIR / f"happy_birthday_{_safe_name(name)}.mp3"
+def _mp3_path_for(name: str, slug: Optional[str] = None) -> Path:
+    """Predictable output path the video step picks up. With `slug`, write
+    output/<slug>.mp3 (custom occasion) so it never collides with the bare
+    name's happy_birthday_<name>.mp3 (e.g. a real "Lucy" birthday)."""
+    stem = _safe_name(slug) if slug else f"happy_birthday_{_safe_name(name)}"
+    return OUTPUT_DIR / f"{stem}.mp3"
 
 
 # --- The actual pipeline (calls the untouched song functions) ---------------
@@ -158,6 +163,7 @@ def _generate(job: Job) -> Path:
         duration_s=job.duration,
         use_cache=True,
         verbose=False,
+        lyrics=job.lyrics,
     )
 
     vocals = wav.with_name(wav.stem + "__vocals.wav")
@@ -169,7 +175,7 @@ def _generate(job: Job) -> Path:
         tighten_pauses(vocals, tight, verbose=False)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    mp3 = _mp3_path_for(job.name)
+    mp3 = _mp3_path_for(job.name, job.slug)
     AudioSegment.from_wav(str(tight)).export(str(mp3), format="mp3", bitrate="192k")
     return mp3
 
@@ -319,6 +325,8 @@ class JobRequest(BaseModel):
     name: str
     voice: Optional[int] = None
     duration: float = DEFAULT_DURATION_S
+    lyrics: Optional[str] = None
+    slug: Optional[str] = None
 
 
 def _status_payload(job: Job) -> dict:
@@ -349,7 +357,7 @@ def submit(req: JobRequest) -> dict:
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
 
-    job_id = _job_id(req.name, req.voice, req.duration)
+    job_id = _job_id(req.name, req.voice, req.duration, req.lyrics, req.slug)
 
     with _JOBS_LOCK:
         existing = _JOBS.get(job_id)
@@ -359,17 +367,19 @@ def submit(req: JobRequest) -> dict:
 
         # Completed in a previous run (process restarted) but the MP3 is
         # still on disk → report done without re-rendering.
-        mp3 = _mp3_path_for(req.name)
+        mp3 = _mp3_path_for(req.name, req.slug)
         if mp3.exists():
             job = Job(job_id=job_id, name=req.name, voice=req.voice,
-                      duration=req.duration, status="done", mp3_path=str(mp3),
+                      duration=req.duration, lyrics=req.lyrics, slug=req.slug,
+                      status="done", mp3_path=str(mp3),
                       finished_at=datetime.now().isoformat(timespec="seconds"))
             _JOBS[job_id] = job
             return _status_payload(job)
 
         # Fresh (or a previously-errored) job → (re)queue it.
         job = Job(job_id=job_id, name=req.name, voice=req.voice,
-                  duration=req.duration, status="queued")
+                  duration=req.duration, lyrics=req.lyrics, slug=req.slug,
+                  status="queued")
         _JOBS[job_id] = job
 
     _WORK_QUEUE.put(job_id)

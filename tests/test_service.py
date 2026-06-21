@@ -44,7 +44,7 @@ def svc(tmp_path, monkeypatch):
 
     # Fast fake render: write a tiny stand-in MP3 where the real one would go.
     def fake_generate(job):
-        p = module._mp3_path_for(job.name)
+        p = module._mp3_path_for(job.name, job.slug)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"ID3\x04\x00fake-mp3-bytes")
         return p
@@ -264,7 +264,7 @@ def test_generate_pipeline_order(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path / "out")
     calls = []
 
-    def fake_render(name, voice_index=None, duration_s=150.0, use_cache=True, verbose=True):
+    def fake_render(name, voice_index=None, duration_s=150.0, use_cache=True, verbose=True, lyrics=None):
         calls.append("render")
         p = tmp_path / "render.wav"
         p.write_bytes(b"wav")
@@ -303,3 +303,34 @@ def test_generate_pipeline_order(tmp_path, monkeypatch):
     assert calls == ["render", "isolate", "tighten", "encode"]
     assert mp3 == module._mp3_path_for("Adam")
     assert mp3.exists()
+
+
+def test_job_id_changes_with_lyrics_and_slug():
+    from service import app as module
+    plain = module._job_id("Lucy", None, 150.0)
+    custom = module._job_id("Lucy", None, 150.0, lyrics="[verse]\nx", slug="lucy_300")
+    assert plain != custom
+    # Deterministic for the same custom inputs.
+    assert custom == module._job_id("Lucy", None, 150.0, lyrics="[verse]\nx", slug="lucy_300")
+
+
+def test_mp3_path_uses_slug_when_given(tmp_path, monkeypatch):
+    from service import app as module
+    monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path)
+    assert module._mp3_path_for("Lucy", "lucy_300_subscribers") == tmp_path / "lucy_300_subscribers.mp3"
+    # No slug → unchanged username-based path.
+    assert module._mp3_path_for("Lucy") == tmp_path / "happy_birthday_lucy.mp3"
+
+
+def test_custom_lyrics_job_renders_to_slug_file(svc):
+    client, module = svc
+    r = client.post("/jobs", json={
+        "name": "Lucy",
+        "slug": "lucy_300_subscribers",
+        "lyrics": "[verse]\nHappy three hundred subscribers",
+    })
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    done = _poll(client, job_id)
+    assert done["status"] == "done"
+    assert Path(done["mp3_path"]).name == "lucy_300_subscribers.mp3"
