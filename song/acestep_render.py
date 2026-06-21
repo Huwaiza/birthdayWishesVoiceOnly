@@ -98,6 +98,7 @@ def render(
     use_cache: bool = True,
     verbose: bool = True,
     precision: str = "float16",
+    lyrics: Optional[str] = None,
 ) -> Path:
     """
     Render one birthday song end-to-end.
@@ -106,6 +107,8 @@ def render(
     ----------
     name : str
         Recipient's name. Injected into [verse]/[chorus]/[outro] lyrics.
+    lyrics : str or None
+        Explicit ACE-Step tagged lyrics. None → build_lyrics(name) (birthday).
     voice_index : int or None
         Pin a specific voice profile (0..N-1). None → hash(name)-based rotation.
     duration_s : float
@@ -133,7 +136,7 @@ def render(
     """
     profile = pick_voice(name, override_index=voice_index)
     seed = seed_for(profile, name)
-    lyrics = build_lyrics(name)
+    lyrics = lyrics if lyrics is not None else build_lyrics(name)
 
     cache_dir = Path(cache_dir) if cache_dir else (
         Path(__file__).resolve().parent.parent / "cache" / "acestep"
