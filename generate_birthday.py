@@ -69,6 +69,21 @@ def main() -> None:
                     help="ACE-Step inference steps (default 60; lower = faster, lower quality)")
     ap.add_argument("--guidance", type=float, default=15.0,
                     help="Classifier-free guidance scale (default 15)")
+    ap.add_argument("--guidance-text", type=float, default=0.0, dest="guidance_text",
+                    help="ACE-Step double-condition guidance, text scale "
+                         "(default 0 = off). Enable BOTH this and "
+                         "--guidance-lyric > 1 for stronger lyric adherence; "
+                         "upstream suggests 5.0 / 1.5. Adds ~33%% diffusion time.")
+    ap.add_argument("--guidance-lyric", type=float, default=0.0, dest="guidance_lyric",
+                    help="ACE-Step double-condition guidance, lyric scale "
+                         "(default 0 = off). See --guidance-text.")
+    ap.add_argument("--no-qc", action="store_true", dest="no_qc",
+                    help="Skip the post-render QC gate (sung-time + Whisper "
+                         "transcript checks) and its seed-retry. QC only runs "
+                         "in vocals-only mode.")
+    ap.add_argument("--qc-retries", type=int, default=1, dest="qc_retries",
+                    help="Max re-renders (with a new seed) when QC fails "
+                         "(default 1)")
     ap.add_argument("--precision", choices=["float16", "float32"], default="float16",
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use to ~14 GB; on Macs with "
@@ -122,36 +137,40 @@ def main() -> None:
     print(f"  Output   : {output_mp3}")
     print("=" * 60 + "\n")
 
-    from song.acestep_render import render, format_duration
-    wav_path = render(
-        name=args.name,
-        voice_index=args.voice,
-        duration_s=args.duration,
-        infer_step=args.steps,
-        guidance_scale=args.guidance,
-        use_cache=not args.no_cache,
-        verbose=True,
-        precision=args.precision,
-    )
-
-    print(f"\n[main] WAV ready: {wav_path}")
-
-    if not args.with_music:
-        from song.vocal_isolate import isolate_vocals, tighten_pauses
-        vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
-        if vocals_wav.exists() and not args.no_cache:
-            print(f"[main] cached vocal stem: {vocals_wav.name}")
-        else:
-            print(f"[main] Isolating vocals — removing all instruments...")
-            isolate_vocals(wav_path, vocals_wav, verbose=True)
-
-        tight_wav = wav_path.with_name(wav_path.stem + "__vocal_tight.wav")
-        if tight_wav.exists() and not args.no_cache:
-            print(f"[main] cached tightened vocal: {tight_wav.name}")
-        else:
-            print(f"[main] Tightening long silent gaps (melody untouched)...")
-            tighten_pauses(vocals_wav, tight_wav, verbose=True)
-        wav_path = tight_wav
+    from song.acestep_render import format_duration
+    qc_report = None
+    if args.with_music:
+        from song.acestep_render import render
+        wav_path = render(
+            name=args.name,
+            voice_index=args.voice,
+            duration_s=args.duration,
+            infer_step=args.steps,
+            guidance_scale=args.guidance,
+            guidance_scale_text=args.guidance_text,
+            guidance_scale_lyric=args.guidance_lyric,
+            use_cache=not args.no_cache,
+            verbose=True,
+            precision=args.precision,
+        )
+        print(f"\n[main] WAV ready: {wav_path}")
+    else:
+        from song.pipeline import generate_vocal_song
+        wav_path, qc_report = generate_vocal_song(
+            args.name,
+            voice_index=args.voice,
+            duration_s=args.duration,
+            infer_step=args.steps,
+            guidance_scale=args.guidance,
+            guidance_scale_text=args.guidance_text,
+            guidance_scale_lyric=args.guidance_lyric,
+            use_cache=not args.no_cache,
+            verbose=True,
+            precision=args.precision,
+            qc_enabled=not args.no_qc,
+            qc_max_retries=args.qc_retries,
+        )
+        print(f"\n[main] tightened vocal ready: {wav_path}")
 
     print(f"[main] Encoding 192 kbps MP3 → {output_mp3}")
     _wav_to_mp3(wav_path, output_mp3)
@@ -161,6 +180,8 @@ def main() -> None:
     elapsed = time.time() - script_t0
     print("\n" + "=" * 60)
     print(f"  ✓  Done!  {size_mb:.1f} MB  →  {output_mp3}")
+    if qc_report is not None:
+        print(f"  QC       : {qc_report.summary()}")
     print(f"  Started  : {started_at:%Y-%m-%d %H:%M:%S}")
     print(f"  Finished : {finished_at:%Y-%m-%d %H:%M:%S}")
     print(f"  Total    : {format_duration(elapsed)}  ({elapsed:.0f}s)")

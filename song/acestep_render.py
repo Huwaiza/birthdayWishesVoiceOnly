@@ -99,6 +99,9 @@ def render(
     verbose: bool = True,
     precision: str = "float16",
     lyrics: Optional[str] = None,
+    guidance_scale_text: float = 0.0,
+    guidance_scale_lyric: float = 0.0,
+    seed_offset: int = 0,
 ) -> Path:
     """
     Render one birthday song end-to-end.
@@ -129,13 +132,26 @@ def render(
         "float16" (default) or "float32". float16 halves the model's RAM
         footprint (~7 GB vs ~14 GB) and prevents disk swapping on Macs with
         <=18 GB. See _get_pipeline() for the full rationale.
+    guidance_scale_text, guidance_scale_lyric : float
+        ACE-Step's "double condition" guidance for stronger lyric adherence.
+        Both 0.0 (default) = off, exactly the pre-existing behaviour. ACE-Step
+        only activates it when BOTH are > 1.0 (its UI suggests text=5.0,
+        lyric=1.5 as a starting point); while active it replaces the
+        cfg/apg combination inside the guidance interval, so guidance_scale
+        is not applied there — A/B by ear before adopting. Costs one extra
+        transformer pass per guided step (~+33% diffusion time at the
+        default guidance_interval of 0.5).
+    seed_offset : int
+        Added to the deterministic per-name seed. Used by the QC retry to
+        re-roll a render that dropped lyrics, while staying reproducible:
+        (name, voice, seed_offset) always maps to the same audio.
 
     Returns
     -------
     Path to the rendered WAV.
     """
     profile = pick_voice(name, override_index=voice_index)
-    seed = seed_for(profile, name)
+    seed = seed_for(profile, name) + seed_offset
     lyrics = lyrics if lyrics is not None else build_lyrics(name)
 
     cache_dir = Path(cache_dir) if cache_dir else (
@@ -143,7 +159,7 @@ def render(
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_key = _hash(
+    key_parts = [
         name.strip().lower(),
         profile.name,
         str(seed),
@@ -152,7 +168,14 @@ def render(
         f"{duration_s:.1f}",
         f"{infer_step}",
         f"{guidance_scale:.2f}",
-    )
+    ]
+    # Lyric guidance joins the key only when set, so every WAV cached before
+    # these params existed keeps its key (0.0/0.0 hashes identically to the
+    # old scheme). seed_offset needs no part of its own — it's in the seed.
+    if guidance_scale_text or guidance_scale_lyric:
+        key_parts += [f"gst{guidance_scale_text:.2f}",
+                      f"gsl{guidance_scale_lyric:.2f}"]
+    cache_key = _hash(*key_parts)
     cached_wav = cache_dir / f"{name.lower().replace(' ', '_')}__{profile.name}__{cache_key}.wav"
 
     target_wav = Path(output_path) if output_path else cached_wav
@@ -166,8 +189,12 @@ def render(
         return target_wav
 
     if verbose:
-        print(f"[acestep_render] rendering '{name}' → voice={profile.name} seed={seed}")
+        print(f"[acestep_render] rendering '{name}' → voice={profile.name} seed={seed}"
+              + (f" (offset +{seed_offset})" if seed_offset else ""))
         print(f"[acestep_render] duration={duration_s:.0f}s steps={infer_step} cfg={guidance_scale}")
+        if guidance_scale_text or guidance_scale_lyric:
+            print(f"[acestep_render] lyric guidance ON — "
+                  f"text={guidance_scale_text} lyric={guidance_scale_lyric}")
 
     pipeline = _get_pipeline(precision=precision)
 
@@ -185,6 +212,8 @@ def render(
         scheduler_type="euler",
         cfg_type="apg",
         omega_scale=10.0,
+        guidance_scale_text=guidance_scale_text,
+        guidance_scale_lyric=guidance_scale_lyric,
         manual_seeds=str(seed),
         save_path=str(cached_wav),
         batch_size=1,

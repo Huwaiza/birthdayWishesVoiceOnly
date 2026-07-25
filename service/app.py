@@ -103,9 +103,19 @@ class Job:
     duration: float
     lyrics: Optional[str] = None
     slug: Optional[str] = None
+    # ACE-Step double-condition (lyric-adherence) guidance. 0.0/0.0 = off =
+    # identical to pre-existing behaviour; ACE-Step activates it only when
+    # both are > 1.0 (suggested starting point: text=5.0, lyric=1.5).
+    guidance_scale_text: float = 0.0
+    guidance_scale_lyric: float = 0.0
+    # Post-render QC gate (sung-time + transcript checks) with seed-retry.
+    qc: bool = True
+    qc_max_retries: int = 1
     status: str = "queued"          # queued → running → done | error
     mp3_path: Optional[str] = None
     error: Optional[str] = None
+    qc_passed: Optional[bool] = None    # None = QC off / not run (e.g. cached MP3)
+    qc_info: Optional[dict] = None
     submitted_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     finished_at: Optional[str] = None
     render_started_at: Optional[float] = None   # monotonic-ish wall clock; set when status→running
@@ -132,11 +142,19 @@ def _safe_name(name: str) -> str:
 
 
 def _job_id(name: str, voice: Optional[int], duration: float,
-            lyrics: Optional[str] = None, slug: Optional[str] = None) -> str:
+            lyrics: Optional[str] = None, slug: Optional[str] = None,
+            guidance_scale_text: float = 0.0, guidance_scale_lyric: float = 0.0,
+            qc: bool = True) -> str:
     """Deterministic id from the render parameters, so re-submitting the
-    same request dedupes onto the same job instead of rendering twice."""
+    same request dedupes onto the same job instead of rendering twice.
+    The newer parameters join the key only at non-default values, so every
+    id minted before they existed stays reachable."""
     lyrics_key = hashlib.md5(lyrics.encode("utf-8")).hexdigest() if lyrics else ""
     key = f"{_safe_name(name)}|{voice}|{duration:.1f}|{slug or ''}|{lyrics_key}"
+    if guidance_scale_text or guidance_scale_lyric:
+        key += f"|gst{guidance_scale_text:.2f}|gsl{guidance_scale_lyric:.2f}"
+    if not qc:
+        key += "|noqc"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
 
@@ -151,28 +169,28 @@ def _mp3_path_for(name: str, slug: Optional[str] = None) -> Path:
 # --- The actual pipeline (calls the untouched song functions) ---------------
 
 def _generate(job: Job) -> Path:
-    """render → isolate → tighten → mp3, exactly like generate_birthday.py
-    --acapella. Reuses the on-disk caches keyed by render parameters."""
+    """render → isolate → tighten → QC/retry → mp3, via the shared
+    song.pipeline used by the CLI. Reuses the on-disk caches keyed by
+    render parameters."""
     from pydub import AudioSegment
-    from song.acestep_render import render
-    from song.vocal_isolate import isolate_vocals, tighten_pauses
+    from song.pipeline import generate_vocal_song
 
-    wav = render(
-        name=job.name,
+    tight, report = generate_vocal_song(
+        job.name,
         voice_index=job.voice,
         duration_s=job.duration,
+        guidance_scale_text=job.guidance_scale_text,
+        guidance_scale_lyric=job.guidance_scale_lyric,
         use_cache=True,
         verbose=False,
         lyrics=job.lyrics,
+        qc_enabled=job.qc,
+        qc_max_retries=job.qc_max_retries,
     )
-
-    vocals = wav.with_name(wav.stem + "__vocals.wav")
-    if not vocals.exists():
-        isolate_vocals(wav, vocals, verbose=False)
-
-    tight = wav.with_name(wav.stem + "__vocal_tight.wav")
-    if not tight.exists():
-        tighten_pauses(vocals, tight, verbose=False)
+    if report is not None:
+        with _JOBS_LOCK:
+            job.qc_passed = report.passed
+            job.qc_info = report.to_dict()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     mp3 = _mp3_path_for(job.name, job.slug)
@@ -327,6 +345,13 @@ class JobRequest(BaseModel):
     duration: float = DEFAULT_DURATION_S
     lyrics: Optional[str] = None
     slug: Optional[str] = None
+    # Lyric-adherence (double-condition) guidance. Defaults keep the exact
+    # pre-existing render behaviour; set text=5.0, lyric=1.5 to enable.
+    guidance_scale_text: float = 0.0
+    guidance_scale_lyric: float = 0.0
+    # QC gate + seed retry. qc=false reproduces the old fire-and-hope path.
+    qc: bool = True
+    qc_max_retries: int = 1
 
 
 def _status_payload(job: Job) -> dict:
@@ -338,6 +363,8 @@ def _status_payload(job: Job) -> dict:
         "error": job.error,
         "submitted_at": job.submitted_at,
         "finished_at": job.finished_at,
+        "qc_passed": job.qc_passed,
+        "qc": job.qc_info,
     }
 
 
@@ -357,7 +384,8 @@ def submit(req: JobRequest) -> dict:
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
 
-    job_id = _job_id(req.name, req.voice, req.duration, req.lyrics, req.slug)
+    job_id = _job_id(req.name, req.voice, req.duration, req.lyrics, req.slug,
+                     req.guidance_scale_text, req.guidance_scale_lyric, req.qc)
 
     with _JOBS_LOCK:
         existing = _JOBS.get(job_id)
@@ -366,11 +394,16 @@ def submit(req: JobRequest) -> dict:
             return _status_payload(existing)
 
         # Completed in a previous run (process restarted) but the MP3 is
-        # still on disk → report done without re-rendering.
+        # still on disk → report done without re-rendering. NB: the MP3 path
+        # depends only on name/slug, so A/B arms of the same name MUST use
+        # distinct slugs or the second arm short-circuits here.
         mp3 = _mp3_path_for(req.name, req.slug)
         if mp3.exists():
             job = Job(job_id=job_id, name=req.name, voice=req.voice,
                       duration=req.duration, lyrics=req.lyrics, slug=req.slug,
+                      guidance_scale_text=req.guidance_scale_text,
+                      guidance_scale_lyric=req.guidance_scale_lyric,
+                      qc=req.qc, qc_max_retries=req.qc_max_retries,
                       status="done", mp3_path=str(mp3),
                       finished_at=datetime.now().isoformat(timespec="seconds"))
             _JOBS[job_id] = job
@@ -379,6 +412,9 @@ def submit(req: JobRequest) -> dict:
         # Fresh (or a previously-errored) job → (re)queue it.
         job = Job(job_id=job_id, name=req.name, voice=req.voice,
                   duration=req.duration, lyrics=req.lyrics, slug=req.slug,
+                  guidance_scale_text=req.guidance_scale_text,
+                  guidance_scale_lyric=req.guidance_scale_lyric,
+                  qc=req.qc, qc_max_retries=req.qc_max_retries,
                   status="queued")
         _JOBS[job_id] = job
 

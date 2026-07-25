@@ -255,16 +255,17 @@ def test_audio_endpoint(svc):
 # --- the real orchestration (song functions mocked, not the model) ----------
 
 def test_generate_pipeline_order(tmp_path, monkeypatch):
-    """_generate must call render → isolate_vocals → tighten_pauses → encode,
-    in that order, and write a username-based MP3."""
+    """_generate must call render → isolate_vocals → tighten_pauses → qc →
+    encode, in that order, and write a username-based MP3."""
     import song.acestep_render as ar
     import song.vocal_isolate as vi
+    import song.qc as qc_mod
     from service import app as module
 
     monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path / "out")
     calls = []
 
-    def fake_render(name, voice_index=None, duration_s=150.0, use_cache=True, verbose=True, lyrics=None):
+    def fake_render(name, **kw):
         calls.append("render")
         p = tmp_path / "render.wav"
         p.write_bytes(b"wav")
@@ -280,9 +281,15 @@ def test_generate_pipeline_order(tmp_path, monkeypatch):
         Path(out).write_bytes(b"tight")
         return Path(out)
 
+    def fake_qc(tight, **kw):
+        calls.append("qc")
+        return qc_mod.QCReport(passed=True, reasons=[], sung_seconds=100.0,
+                               phrase_count=10, asr_used=False)
+
     monkeypatch.setattr(ar, "render", fake_render)
     monkeypatch.setattr(vi, "isolate_vocals", fake_isolate)
     monkeypatch.setattr(vi, "tighten_pauses", fake_tighten)
+    monkeypatch.setattr(qc_mod, "run_qc", fake_qc)
 
     # Fake pydub so no ffmpeg is needed: from_wav(...).export(mp3) writes a file.
     class _FakeSeg:
@@ -300,9 +307,11 @@ def test_generate_pipeline_order(tmp_path, monkeypatch):
     job = module.Job(job_id="x", name="Adam", voice=None, duration=150.0)
     mp3 = module._generate(job)
 
-    assert calls == ["render", "isolate", "tighten", "encode"]
+    assert calls == ["render", "isolate", "tighten", "qc", "encode"]
     assert mp3 == module._mp3_path_for("Adam")
     assert mp3.exists()
+    assert job.qc_passed is True
+    assert job.qc_info["sung_seconds"] == 100.0
 
 
 def test_job_id_changes_with_lyrics_and_slug():
@@ -312,6 +321,39 @@ def test_job_id_changes_with_lyrics_and_slug():
     assert plain != custom
     # Deterministic for the same custom inputs.
     assert custom == module._job_id("Lucy", None, 150.0, lyrics="[verse]\nx", slug="lucy_300")
+
+
+def test_job_id_stable_at_defaults_but_changes_with_guidance_and_qc():
+    """Ids minted before the guidance/qc params existed must stay reachable:
+    default values add nothing to the key. Non-default values fork the id,
+    which is what makes A/B submissions distinct jobs."""
+    from service import app as module
+    old_style = module._job_id("Lucy", None, 150.0)
+    defaults = module._job_id("Lucy", None, 150.0,
+                              guidance_scale_text=0.0, guidance_scale_lyric=0.0,
+                              qc=True)
+    assert old_style == defaults
+    guided = module._job_id("Lucy", None, 150.0,
+                            guidance_scale_text=5.0, guidance_scale_lyric=1.5)
+    assert guided != old_style
+    no_qc = module._job_id("Lucy", None, 150.0, qc=False)
+    assert no_qc != old_style and no_qc != guided
+
+
+def test_submit_carries_guidance_and_qc_to_the_job(svc):
+    client, module = svc
+    body = client.post("/jobs", json={
+        "name": "Guided", "slug": "guided_on",
+        "guidance_scale_text": 5.0, "guidance_scale_lyric": 1.5,
+        "qc": True, "qc_max_retries": 2,
+    }).json()
+    with module._JOBS_LOCK:
+        job = module._JOBS[body["job_id"]]
+    assert job.guidance_scale_text == 5.0
+    assert job.guidance_scale_lyric == 1.5
+    assert job.qc is True and job.qc_max_retries == 2
+    # The payload exposes the QC fields (null until a real render fills them).
+    assert "qc_passed" in body and "qc" in body
 
 
 def test_mp3_path_uses_slug_when_given(tmp_path, monkeypatch):

@@ -52,6 +52,19 @@ def main() -> None:
                     help="ACE-Step inference steps (default 60)")
     ap.add_argument("--guidance", type=float, default=15.0,
                     help="Classifier-free guidance (default 15)")
+    ap.add_argument("--guidance-text", type=float, default=0.0, dest="guidance_text",
+                    help="ACE-Step double-condition guidance, text scale "
+                         "(default 0 = off). Enable BOTH this and "
+                         "--guidance-lyric > 1 for stronger lyric adherence; "
+                         "upstream suggests 5.0 / 1.5.")
+    ap.add_argument("--guidance-lyric", type=float, default=0.0, dest="guidance_lyric",
+                    help="ACE-Step double-condition guidance, lyric scale "
+                         "(default 0 = off). See --guidance-text.")
+    ap.add_argument("--no-qc", action="store_true", dest="no_qc",
+                    help="Skip the post-render QC gate + seed-retry "
+                         "(vocals-only mode)")
+    ap.add_argument("--qc-retries", type=int, default=1, dest="qc_retries",
+                    help="Max QC re-renders with a new seed per name (default 1)")
     ap.add_argument("--precision", choices=["float16", "float32"], default="float16",
                     help="Model precision (default float16: ~7 GB RAM, fast). "
                          "float32 doubles RAM use; on Macs with <=18 GB that "
@@ -98,10 +111,10 @@ def main() -> None:
     from song.voice_profiles import pick_voice
     from pydub import AudioSegment
     if not args.with_music:
-        from song.vocal_isolate import isolate_vocals, tighten_pauses
+        from song.pipeline import generate_vocal_song
 
     t_batch = time.time()
-    succeeded, failed, cached = [], [], []
+    succeeded, failed, cached, qc_flagged = [], [], [], []
 
     for i, name in enumerate(names, start=1):
         safe = name.lower().replace(" ", "_").replace("/", "_")
@@ -119,28 +132,41 @@ def main() -> None:
         for attempt in range(1, args.retries + 2):  # retries=1 → 2 total attempts
             try:
                 t0 = time.time()
-                wav_path = render(
-                    name=name,
-                    voice_index=args.voice,
-                    duration_s=args.duration,
-                    infer_step=args.steps,
-                    guidance_scale=args.guidance,
-                    use_cache=not args.no_cache,
-                    verbose=False,
-                    precision=args.precision,
-                )
-                # Validate the WAV is non-empty
-                if wav_path.stat().st_size < 50_000:
-                    raise RuntimeError(f"WAV looks too small: {wav_path.stat().st_size} bytes")
-
-                if not args.with_music:
-                    vocals_wav = wav_path.with_name(wav_path.stem + "__vocals.wav")
-                    if not (vocals_wav.exists() and not args.no_cache):
-                        isolate_vocals(wav_path, vocals_wav, verbose=False)
-                    tight_wav = wav_path.with_name(wav_path.stem + "__vocal_tight.wav")
-                    if not (tight_wav.exists() and not args.no_cache):
-                        tighten_pauses(vocals_wav, tight_wav, verbose=False)
-                    wav_path = tight_wav
+                if args.with_music:
+                    wav_path = render(
+                        name=name,
+                        voice_index=args.voice,
+                        duration_s=args.duration,
+                        infer_step=args.steps,
+                        guidance_scale=args.guidance,
+                        guidance_scale_text=args.guidance_text,
+                        guidance_scale_lyric=args.guidance_lyric,
+                        use_cache=not args.no_cache,
+                        verbose=False,
+                        precision=args.precision,
+                    )
+                    # Validate the WAV is non-empty
+                    if wav_path.stat().st_size < 50_000:
+                        raise RuntimeError(f"WAV looks too small: {wav_path.stat().st_size} bytes")
+                else:
+                    wav_path, qc_report = generate_vocal_song(
+                        name,
+                        voice_index=args.voice,
+                        duration_s=args.duration,
+                        infer_step=args.steps,
+                        guidance_scale=args.guidance,
+                        guidance_scale_text=args.guidance_text,
+                        guidance_scale_lyric=args.guidance_lyric,
+                        use_cache=not args.no_cache,
+                        verbose=False,
+                        precision=args.precision,
+                        qc_enabled=not args.no_qc,
+                        qc_max_retries=args.qc_retries,
+                    )
+                    if qc_report is not None and not qc_report.passed:
+                        qc_flagged.append((name, "; ".join(qc_report.reasons)))
+                        print(f"  ⚠ QC failed after retries — kept best attempt "
+                              f"({qc_report.summary()})")
 
                 AudioSegment.from_wav(str(wav_path)).export(
                     str(mp3_path), format="mp3", bitrate="192k"
@@ -168,6 +194,11 @@ def main() -> None:
     print(f"  Rendered : {len(succeeded)}")
     print(f"  Cached   : {len(cached)}")
     print(f"  Failed   : {len(failed)}")
+    print(f"  QC-flag  : {len(qc_flagged)}  (shipped best attempt; listen before sending)")
+    if qc_flagged:
+        print("\n  QC-flagged:")
+        for n, why in qc_flagged:
+            print(f"    - {n}: {why}")
     if failed:
         print("\n  Failures:")
         for n, err in failed:
