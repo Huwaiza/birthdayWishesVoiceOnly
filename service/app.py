@@ -61,6 +61,16 @@ OUTPUT_DIR = Path(os.environ.get("BIRTHDAY_OUTPUT_DIR", _REPO_ROOT / "output"))
 # Render defaults — match the CLI so service output == `--acapella` output.
 DEFAULT_DURATION_S = 150.0
 
+# Diffusion steps per render. This is the dominant compute knob: cost is close
+# to linear in it, so it decides both how long a render pegs the GPU and how
+# hot the machine gets. 60 is ACE-Step's own default and the long-standing
+# value here; lower it only against measured evidence from bench_render.py,
+# which scores each setting with the same QC gate this service uses.
+#
+# Exposed as an env var because the usual caller posts only {"name": ...} —
+# without this there is no way to retune the pipeline short of editing source.
+DEFAULT_INFER_STEP = int(os.environ.get("RENDER_INFER_STEP", "60"))
+
 # --- Render watchdog --------------------------------------------------------
 # A single worker renders jobs one at a time, and a render is a heavy in-process
 # model call with no built-in timeout. If one hangs (model deadlock, resource
@@ -127,6 +137,8 @@ class Job:
     # Post-render QC gate (sung-time + transcript checks) with seed-retry.
     qc: bool = True
     qc_max_retries: int = 1
+    # Diffusion steps — the dominant compute cost. See DEFAULT_INFER_STEP.
+    infer_step: int = DEFAULT_INFER_STEP
     status: str = "queued"          # queued → running → done | error
     mp3_path: Optional[str] = None
     error: Optional[str] = None
@@ -160,7 +172,7 @@ def _safe_name(name: str) -> str:
 def _job_id(name: str, voice: Optional[int], duration: float,
             lyrics: Optional[str] = None, slug: Optional[str] = None,
             guidance_scale_text: float = 0.0, guidance_scale_lyric: float = 0.0,
-            qc: bool = True) -> str:
+            qc: bool = True, infer_step: int = 60) -> str:
     """Deterministic id from the render parameters, so re-submitting the
     same request dedupes onto the same job instead of rendering twice.
     The newer parameters join the key only at non-default values, so every
@@ -171,6 +183,10 @@ def _job_id(name: str, voice: Optional[int], duration: float,
         key += f"|gst{guidance_scale_text:.2f}|gsl{guidance_scale_lyric:.2f}"
     if not qc:
         key += "|noqc"
+    # Step count changes the audio, so it has to separate jobs — but it joins
+    # the key only away from 60, keeping every id minted before it was tunable.
+    if infer_step != 60:
+        key += f"|steps{infer_step}"
     return hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
 
 
@@ -195,6 +211,7 @@ def _generate(job: Job) -> Path:
         job.name,
         voice_index=job.voice,
         duration_s=job.duration,
+        infer_step=job.infer_step,
         guidance_scale_text=job.guidance_scale_text,
         guidance_scale_lyric=job.guidance_scale_lyric,
         use_cache=True,
@@ -418,6 +435,10 @@ class JobRequest(BaseModel):
     # QC gate + seed retry. qc=false reproduces the old fire-and-hope path.
     qc: bool = True
     qc_max_retries: int = 1
+    # Diffusion steps. Omit to use RENDER_INFER_STEP (default 60) — the usual
+    # caller posts only {"name": ...}, so the env var is how this gets retuned
+    # fleet-wide; this field is for per-request A/B against it.
+    infer_step: int = DEFAULT_INFER_STEP
 
 
 def _status_payload(job: Job) -> dict:
@@ -451,7 +472,8 @@ def submit(req: JobRequest) -> dict:
         raise HTTPException(status_code=400, detail="name is required")
 
     job_id = _job_id(req.name, req.voice, req.duration, req.lyrics, req.slug,
-                     req.guidance_scale_text, req.guidance_scale_lyric, req.qc)
+                     req.guidance_scale_text, req.guidance_scale_lyric, req.qc,
+                     req.infer_step)
 
     with _JOBS_LOCK:
         existing = _JOBS.get(job_id)
@@ -470,6 +492,7 @@ def submit(req: JobRequest) -> dict:
                       guidance_scale_text=req.guidance_scale_text,
                       guidance_scale_lyric=req.guidance_scale_lyric,
                       qc=req.qc, qc_max_retries=req.qc_max_retries,
+                      infer_step=req.infer_step,
                       status="done", mp3_path=str(mp3),
                       finished_at=datetime.now().isoformat(timespec="seconds"))
             _JOBS[job_id] = job
@@ -481,6 +504,7 @@ def submit(req: JobRequest) -> dict:
                   guidance_scale_text=req.guidance_scale_text,
                   guidance_scale_lyric=req.guidance_scale_lyric,
                   qc=req.qc, qc_max_retries=req.qc_max_retries,
+                  infer_step=req.infer_step,
                   status="queued")
         _JOBS[job_id] = job
 

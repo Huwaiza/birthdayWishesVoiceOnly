@@ -188,6 +188,80 @@ def test_free_render_memory_is_safe_to_call(svc):
     module._free_render_memory()  # should be a no-op-safe call
 
 
+def test_infer_step_60_keeps_legacy_job_ids(svc):
+    """The step count joins the job id only away from 60, so every id minted
+    before infer_step was tunable still resolves — otherwise switching to this
+    build would orphan the existing render cache."""
+    client, module = svc
+    legacy = module._job_id("Lucy", None, 150.0)
+    assert module._job_id("Lucy", None, 150.0, infer_step=60) == legacy
+
+
+def test_infer_step_changes_the_job_id(svc):
+    """Different step counts produce different audio, so they must not dedupe
+    onto one another."""
+    client, module = svc
+    base = module._job_id("Lucy", None, 150.0, infer_step=60)
+    assert module._job_id("Lucy", None, 150.0, infer_step=30) != base
+    assert (module._job_id("Lucy", None, 150.0, infer_step=30)
+            != module._job_id("Lucy", None, 150.0, infer_step=20))
+
+
+def test_submit_records_infer_step_on_the_job(svc):
+    """A per-request infer_step must survive onto the queued Job."""
+    client, module = svc
+    job_id = client.post("/jobs",
+                         json={"name": "Stepped", "infer_step": 24}).json()["job_id"]
+    with module._JOBS_LOCK:
+        assert module._JOBS[job_id].infer_step == 24
+
+
+def test_submit_defaults_infer_step_to_the_configured_default(svc):
+    """The Django caller posts only {"name": ...}; it must inherit
+    DEFAULT_INFER_STEP (i.e. RENDER_INFER_STEP) rather than a hardcoded 60."""
+    client, module = svc
+    job_id = client.post("/jobs", json={"name": "Defaulted"}).json()["job_id"]
+    with module._JOBS_LOCK:
+        assert module._JOBS[job_id].infer_step == module.DEFAULT_INFER_STEP
+
+
+def test_generate_forwards_infer_step_to_the_pipeline(tmp_path, monkeypatch):
+    """The step count has to reach generate_vocal_song. Plumbing that stops at
+    the Job object would leave every render at 60 while the API claimed
+    otherwise — silent, and invisible except as an unchanged fan."""
+    from service import app as module
+    import song.pipeline as pipeline_mod
+
+    monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path / "out")
+    captured = {}
+
+    def fake_generate_vocal_song(name, **kw):
+        captured.update(kw)
+        p = tmp_path / "tight.wav"
+        p.write_bytes(b"wav")
+        return p, None
+
+    monkeypatch.setattr(pipeline_mod, "generate_vocal_song",
+                        fake_generate_vocal_song)
+
+    class _FakeSeg:
+        @staticmethod
+        def from_wav(path):
+            return _FakeSeg()
+
+        def export(self, out, **kw):
+            Path(out).write_bytes(b"mp3")
+
+    import pydub
+    monkeypatch.setattr(pydub, "AudioSegment", _FakeSeg)
+
+    job = module.Job(job_id="x", name="Adam", voice=None, duration=150.0,
+                     infer_step=24)
+    module._generate(job)
+
+    assert captured["infer_step"] == 24
+
+
 def test_soft_reload_due_at_the_threshold_when_idle(svc, monkeypatch):
     """The guard that actually applies to a bare `uvicorn`: after N jobs, with
     nothing queued, drop the models in-process."""
