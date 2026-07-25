@@ -32,7 +32,6 @@ serialized through this service's own queue.
 
 from __future__ import annotations
 
-import gc
 import hashlib
 import os
 import queue
@@ -91,6 +90,23 @@ RENDER_RESTART_AFTER_JOBS = int(os.environ.get("RENDER_RESTART_AFTER_JOBS", "0")
 # "done" sees it before the process goes down. Must exceed the client poll
 # interval (~15s).
 _RESTART_GRACE_S = float(os.environ.get("RENDER_RESTART_GRACE_S", "20"))
+
+# --- Soft reload ------------------------------------------------------------
+# The hard recycle above only helps when something respawns the process, i.e.
+# when the service is started via run_service.sh. Started as a bare `uvicorn`
+# (no supervisor) it is necessarily disabled, which left the accumulation
+# problem completely unguarded in exactly the setup most people run.
+#
+# The soft reload is the supervisor-free equivalent: after this many completed
+# jobs, once the queue is idle, drop every model singleton and release their
+# memory in-process. That is what actually returns the ~7 GB to the OS — the
+# caching allocator can only hand back blocks nothing still references — so the
+# next render starts from a clean, unfragmented slate. Cost is one model reload
+# (~1-2 min) per N songs; at ~20 songs/day that is a couple of minutes a day.
+# Set to 0 to disable.
+RENDER_SOFT_RELOAD_AFTER_JOBS = int(
+    os.environ.get("RENDER_SOFT_RELOAD_AFTER_JOBS", "10")
+)
 
 
 # --- Job bookkeeping --------------------------------------------------------
@@ -217,17 +233,37 @@ def _free_render_memory() -> None:
     the MPS/CUDA caching allocator holds onto each render's working set, so
     pressure only climbs across a session until a render swaps and hangs — the
     exact failure documented in song/acestep_render.py. The model singletons are
-    NOT touched (we only drop intermediates + the per-call separator)."""
-    gc.collect()
-    try:
-        import torch
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available() and hasattr(torch, "mps"):
-            torch.mps.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001 — best-effort; torch may be absent in tests
-        pass
+    NOT touched (only per-render intermediates).
+
+    The implementation lives in song.memory so the batch runner releases memory
+    identically; this wrapper stays for the service's own call sites and tests.
+    """
+    from song.memory import free_render_memory
+    free_render_memory()
+
+
+def _soft_reload_due() -> bool:
+    """True when enough jobs have completed to warrant dropping the models
+    in-process AND nothing is waiting, so the reload can't stall a queued
+    render. No-op when RENDER_SOFT_RELOAD_AFTER_JOBS is 0."""
+    if RENDER_SOFT_RELOAD_AFTER_JOBS <= 0:
+        return False
+    with _JOBS_LOCK:
+        completed = _JOBS_COMPLETED
+    return (completed > 0
+            and completed % RENDER_SOFT_RELOAD_AFTER_JOBS == 0
+            and _WORK_QUEUE.empty())
+
+
+def _soft_reload() -> None:
+    """Drop every model singleton and reclaim their memory. The next job pays
+    the reload cost; see RENDER_SOFT_RELOAD_AFTER_JOBS for the rationale."""
+    from song.memory import format_rss, free_all_models
+    before = format_rss("before")
+    free_all_models()
+    after = format_rss("after")
+    print(f"[service] soft reload after {_JOBS_COMPLETED} jobs — models dropped, "
+          f"memory released ({before} {after}). Next render reloads them.")
 
 
 def _restart_due() -> bool:
@@ -266,7 +302,9 @@ def _worker() -> None:
                     job.status = "done"
                     job.mp3_path = str(mp3)
                     job.finished_at = datetime.now().isoformat(timespec="seconds")
-            print(f"[service] job {job_id} done in {time.time() - t0:.0f}s → {mp3}")
+            from song.memory import format_rss
+            print(f"[service] job {job_id} done in {time.time() - t0:.0f}s → {mp3} "
+                  f"{format_rss()}")
         except Exception as e:  # noqa: BLE001 — report failure, keep serving
             with _JOBS_LOCK:
                 if job.status == "running":
@@ -282,12 +320,19 @@ def _worker() -> None:
 
         # Recycle to a fresh process once we've done enough jobs and the queue
         # has drained — keeps long sessions from accumulating into a hung render.
+        # Only ever enabled under a supervisor that respawns us (run_service.sh).
         if _restart_due():
             print(f"[service] recycling after {_JOBS_COMPLETED} jobs to reset "
                   f"memory; supervisor will respawn a clean process.")
             time.sleep(_RESTART_GRACE_S)   # let a poller fetch the last 'done'
             if _WORK_QUEUE.empty():
                 os._exit(0)
+
+        # No supervisor (or not due yet) → get the same clean slate in-process
+        # by dropping the models. This is the guard that actually applies to a
+        # bare `uvicorn`, where the hard recycle above is necessarily disabled.
+        if _soft_reload_due():
+            _soft_reload()
 
 
 def _watchdog_sweep(now: float) -> list[str]:
@@ -322,11 +367,32 @@ def _watchdog() -> None:
                 os._exit(1)
 
 
+def _log_memory_guards() -> None:
+    """Print which memory guards are actually live.
+
+    Worth the four lines: the hard recycle and the hang restart are opt-in via
+    env vars that only run_service.sh sets, so a bare `uvicorn` silently ran
+    with both disabled and no way to tell from the logs.
+    """
+    hard = (f"recycle every {RENDER_RESTART_AFTER_JOBS} jobs"
+            if RENDER_RESTART_AFTER_JOBS > 0 else "OFF (no supervisor)")
+    soft = (f"soft reload every {RENDER_SOFT_RELOAD_AFTER_JOBS} jobs"
+            if RENDER_SOFT_RELOAD_AFTER_JOBS > 0 else "soft reload: OFF")
+    print(f"[service] memory guards — per-job release: ON; {soft}; "
+          f"process {hard}; hang restart: "
+          f"{'ON' if _WATCHDOG_HARD_RESTART else 'OFF'}")
+    if RENDER_RESTART_AFTER_JOBS <= 0 and RENDER_SOFT_RELOAD_AFTER_JOBS <= 0:
+        print("[service] WARNING: no periodic reset is active — memory pressure "
+              "will accumulate across renders. Run ./run_service.sh, or set "
+              "RENDER_SOFT_RELOAD_AFTER_JOBS.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _BG_STARTED
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if not _BG_STARTED:
+        _log_memory_guards()
         threading.Thread(target=_warm_model, name="model-warmer", daemon=True).start()
         threading.Thread(target=_worker, name="render-worker", daemon=True).start()
         threading.Thread(target=_watchdog, name="render-watchdog", daemon=True).start()

@@ -68,6 +68,18 @@ def _get_pipeline(precision: str = "float16"):
     return _PIPELINE
 
 
+def unload_pipeline() -> None:
+    """Drop the cached ACE-Step pipeline so its ~7 GB can be reclaimed.
+
+    Called by song.memory.free_all_models() during a periodic soft reload: the
+    caching allocator only truly lets go once nothing references the model, so
+    releasing the singleton is what turns an `empty_cache()` into an actual
+    return of memory to the OS. The next render reloads it (~1-2 min).
+    """
+    global _PIPELINE
+    _PIPELINE = None
+
+
 def _hash(*parts: str) -> str:
     h = hashlib.md5()
     for p in parts:

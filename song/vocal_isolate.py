@@ -28,6 +28,22 @@ module imports fine even when the package isn't installed — the dependency
 is only needed at render time, and the error message points at the fix:
 
     pip install "audio-separator[cpu]"
+
+The Separator is a process-wide singleton
+-----------------------------------------
+Loading a model is expensive (weights off disk, tensors allocated) and this
+process renders song after song, so the separator is built ONCE and reused —
+the same treatment ACE-Step and Whisper already get. Rebuilding it per render
+re-allocated the model ~20x a day inside a long-lived process, and torch's
+caching allocator does not hand that memory back cleanly, so the churn showed
+up as steadily climbing memory pressure over a session.
+
+Reuse is safe by the library's own design: `Separator.separate()` calls
+`clear_gpu_cache()` and `clear_file_specific_paths()` after every file, so no
+per-file state survives into the next call. The one constraint is that
+`output_dir` is baked into the model instance at `load_model()` time and cannot
+change per call — hence the fixed work directory below, out of which each
+finished stem is moved to wherever the caller asked for it.
 """
 
 from __future__ import annotations
@@ -48,6 +64,89 @@ _ROFORMER_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 # audio-separator default (/tmp) does not, which would re-download ~200 MB
 # every restart.
 _MODEL_CACHE_DIR = Path.home() / ".cache" / "audio-separator-models"
+
+# Fixed scratch directory the separator writes its stems into. It has to be
+# fixed (not derived from each output path) because `output_dir` is captured
+# when the model loads and can't be varied per call on a reused instance — see
+# the module docstring. Stems are moved out of here immediately, so it only
+# ever holds one render's pair of files.
+_WORK_DIR = Path(__file__).resolve().parent.parent / "cache" / "_separator_tmp"
+
+# Process-wide Separator singleton, loaded on first use and reused for every
+# subsequent render. None = not built yet.
+_SEPARATOR = None
+
+
+def _get_separator(verbose: bool = True):
+    """Build (once) and return the Roformer separator.
+
+    Raises RuntimeError with an actionable message when audio-separator isn't
+    installed — the import is deliberately lazy so this module stays importable
+    without it (the unit tests rely on that).
+    """
+    global _SEPARATOR
+    if _SEPARATOR is not None:
+        return _SEPARATOR
+
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as e:
+        raise RuntimeError(
+            "audio-separator is not installed — it powers --acapella.\n"
+            "    pip install \"audio-separator[cpu]\""
+        ) from e
+
+    _WORK_DIR.mkdir(parents=True, exist_ok=True)
+    _MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"[vocal_isolate] loading Roformer separator (once per process) — "
+              f"first run downloads the model (~200 MB)...")
+    t0 = time.time()
+    separator = Separator(
+        output_dir=str(_WORK_DIR),
+        output_format="WAV",
+        model_file_dir=str(_MODEL_CACHE_DIR),
+        log_level=logging.INFO if verbose else logging.WARNING,
+    )
+    try:
+        separator.load_model(model_filename=_ROFORMER_MODEL)
+    except Exception as e:  # noqa: BLE001 — surface any load failure cleanly
+        raise RuntimeError(
+            f"loading the vocal separation model failed: {e}\n"
+            f"If the model name is unrecognised, run `audio-separator "
+            f"--list_models` and update _ROFORMER_MODEL in song/vocal_isolate.py."
+        ) from e
+
+    _SEPARATOR = separator
+    if verbose:
+        print(f"[vocal_isolate] separator ready in {time.time() - t0:.0f}s")
+    return _SEPARATOR
+
+
+def unload_separator() -> None:
+    """Drop the cached separator so its memory can be reclaimed.
+
+    Called by song.memory.free_all_models() during a periodic soft reload. The
+    next isolate_vocals() rebuilds it. Safe to call when nothing is loaded.
+    """
+    global _SEPARATOR
+    _SEPARATOR = None
+
+
+def _clear_work_dir() -> None:
+    """Empty the scratch directory without removing it — the loaded model holds
+    the path, so the directory itself must survive between renders. Clearing is
+    what stops a previous render's stems from being mistaken for this one's."""
+    _WORK_DIR.mkdir(parents=True, exist_ok=True)
+    for leftover in _WORK_DIR.iterdir():
+        try:
+            if leftover.is_dir():
+                shutil.rmtree(leftover, ignore_errors=True)
+            else:
+                leftover.unlink()
+        except OSError:
+            pass
 
 
 def isolate_vocals(
@@ -87,55 +186,36 @@ def isolate_vocals(
     if not input_wav.exists():
         raise FileNotFoundError(f"input WAV not found: {input_wav}")
 
-    # Lazy import: keeps this module importable without audio-separator
-    # installed (the unit tests rely on that), and defers a heavy import.
-    try:
-        from audio_separator.separator import Separator
-    except ImportError as e:
-        raise RuntimeError(
-            "audio-separator is not installed — it powers --acapella.\n"
-            "    pip install \"audio-separator[cpu]\""
-        ) from e
+    # Built once per process and reused; see the module docstring for why.
+    separator = _get_separator(verbose=verbose)
 
     # The separator writes <input>_(Vocals)_<model>.wav and the matching
-    # _(Instrumental)_ file into output_dir; we keep only the vocal one.
-    work_dir = output_wav.parent / "_separator_tmp"
-    shutil.rmtree(work_dir, ignore_errors=True)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    _MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # _(Instrumental)_ file into its fixed work dir; we keep only the vocal one.
+    # Clear first so a previous render's stems can't be picked up as this one's.
+    _clear_work_dir()
 
     if verbose:
-        print(f"[vocal_isolate] separating vocals from {input_wav.name} "
-              f"(Roformer) — first run downloads the model (~200 MB)...")
+        print(f"[vocal_isolate] separating vocals from {input_wav.name} (Roformer)...")
     t0 = time.time()
 
-    separator = Separator(
-        output_dir=str(work_dir),
-        output_format="WAV",
-        model_file_dir=str(_MODEL_CACHE_DIR),
-        log_level=logging.INFO if verbose else logging.WARNING,
-    )
     try:
-        separator.load_model(model_filename=_ROFORMER_MODEL)
         outputs = separator.separate(str(input_wav))
     except Exception as e:  # noqa: BLE001 — surface any separator failure cleanly
-        raise RuntimeError(
-            f"vocal separation failed: {e}\n"
-            f"If the model name is unrecognised, run `audio-separator "
-            f"--list_models` and update _ROFORMER_MODEL in song/vocal_isolate.py."
-        ) from e
+        raise RuntimeError(f"vocal separation failed: {e}") from e
 
     # Identify the vocal stem. The separator returns the output file names;
     # the vocal one is simply the file that is NOT the instrumental.
-    vocal_file = _pick_vocal_stem(outputs, work_dir)
+    vocal_file = _pick_vocal_stem(outputs, _WORK_DIR)
     if vocal_file is None:
         raise RuntimeError(
-            f"separation ran but no vocal stem was found in {work_dir}"
+            f"separation ran but no vocal stem was found in {_WORK_DIR}"
         )
 
     output_wav.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(vocal_file), str(output_wav))
-    shutil.rmtree(work_dir, ignore_errors=True)
+    # Drop the instrumental stem now rather than leaving a full-length WAV on
+    # disk until the next render needs the directory.
+    _clear_work_dir()
 
     dt = time.time() - t0
     if verbose:

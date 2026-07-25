@@ -15,6 +15,18 @@ Usage
 
 The model loads once and is reused across the whole batch — overhead is
 amortised over N names.
+
+Memory
+------
+Renders accumulate memory pressure: torch's caching allocator keeps freed
+blocks reserved rather than returning them, and on Apple Silicon that comes
+straight out of the same unified memory the OS uses. Left unchecked across a
+20-name batch it ends in swapping, renders that crawl for hours, and macOS
+demanding you quit applications. Two guards, matching the ones the HTTP service
+uses: release per-render memory after every name, and drop the model singletons
+entirely every --reload-every names so the allocator actually hands the ~7 GB
+back. Pass --mem-log to print the resident set size after each name and watch
+that it stays flat.
 """
 
 import argparse
@@ -80,6 +92,14 @@ def main() -> None:
                     help="Pin all renders to a specific voice index (default: rotate)")
     ap.add_argument("--no-cache", action="store_true", dest="no_cache",
                     help="Force re-render every name")
+    ap.add_argument("--reload-every", type=int, default=10, dest="reload_every",
+                    help="Drop and reload the models every N names to reclaim "
+                         "accumulated memory (default 10; 0 disables). Costs "
+                         "~1-2 min per reload, prevents the swap-death spiral "
+                         "on long batches.")
+    ap.add_argument("--mem-log", action="store_true", dest="mem_log",
+                    help="Print process memory (RSS) after each name — use it "
+                         "to confirm the footprint stays flat across a batch")
     ap.add_argument("--start", type=int, default=0,
                     help="Skip the first N names (resume support)")
     ap.add_argument("--limit", type=int, default=None,
@@ -108,6 +128,7 @@ def main() -> None:
 
     # Heavy imports deferred so --help is snappy.
     from song.acestep_render import render, format_duration
+    from song.memory import format_rss, free_all_models, free_render_memory
     from song.voice_profiles import pick_voice
     from pydub import AudioSegment
     if not args.with_music:
@@ -115,6 +136,9 @@ def main() -> None:
 
     t_batch = time.time()
     succeeded, failed, cached, qc_flagged = [], [], [], []
+    # Counts names we actually rendered (cache hits cost no memory), so the
+    # reload cadence tracks real work rather than list position.
+    rendered_count = 0
 
     for i, name in enumerate(names, start=1):
         safe = name.lower().replace(" ", "_").replace("/", "_")
@@ -183,6 +207,24 @@ def main() -> None:
                     print(traceback.format_exc())
         else:
             failed.append((name, str(last_err)))
+
+        # --- Memory hygiene, after every name (success or failure) ----------
+        # Hand this render's working set back before starting the next one;
+        # without it the footprint only climbs across the batch.
+        rendered_count += 1
+        free_render_memory()
+
+        # Every N names, also drop the models themselves. empty_cache() alone
+        # can't release blocks the loaded models still reference, so this is
+        # what actually returns the ~7 GB and resets fragmentation.
+        if args.reload_every > 0 and rendered_count % args.reload_every == 0:
+            before = format_rss("before")
+            free_all_models()
+            print(f"  ⟳ reloading models after {rendered_count} renders to reclaim "
+                  f"memory ({before} {format_rss('after')})")
+
+        if args.mem_log:
+            print(f"  ⌁ {format_rss() or 'rss unavailable (pip install psutil)'}")
 
     total = time.time() - t_batch
     batch_finished = datetime.now()

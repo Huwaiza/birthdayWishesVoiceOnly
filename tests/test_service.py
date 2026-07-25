@@ -188,6 +188,71 @@ def test_free_render_memory_is_safe_to_call(svc):
     module._free_render_memory()  # should be a no-op-safe call
 
 
+def test_soft_reload_due_at_the_threshold_when_idle(svc, monkeypatch):
+    """The guard that actually applies to a bare `uvicorn`: after N jobs, with
+    nothing queued, drop the models in-process."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_SOFT_RELOAD_AFTER_JOBS", 10)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 10)
+    while not module._WORK_QUEUE.empty():
+        module._WORK_QUEUE.get_nowait()
+    assert module._soft_reload_due() is True
+
+
+def test_soft_reload_recurs_every_n_jobs(svc, monkeypatch):
+    """Unlike the one-shot hard recycle, the soft reload has to fire again on
+    every multiple — the process keeps running and keeps accumulating."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_SOFT_RELOAD_AFTER_JOBS", 10)
+    while not module._WORK_QUEUE.empty():
+        module._WORK_QUEUE.get_nowait()
+    for completed, expected in [(10, True), (11, False), (20, True), (25, False)]:
+        monkeypatch.setattr(module, "_JOBS_COMPLETED", completed)
+        assert module._soft_reload_due() is expected, f"at {completed} jobs"
+
+
+def test_soft_reload_not_due_before_any_job(svc, monkeypatch):
+    """0 % N == 0 — guard against reloading models that were never used."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_SOFT_RELOAD_AFTER_JOBS", 10)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 0)
+    assert module._soft_reload_due() is False
+
+
+def test_soft_reload_not_due_while_work_is_pending(svc, monkeypatch):
+    """Never stall a queued render behind a model reload."""
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_SOFT_RELOAD_AFTER_JOBS", 10)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 10)
+    module._WORK_QUEUE.put("pending-job")
+    try:
+        assert module._soft_reload_due() is False
+    finally:
+        module._WORK_QUEUE.get_nowait()
+
+
+def test_soft_reload_can_be_disabled(svc, monkeypatch):
+    client, module = svc
+    monkeypatch.setattr(module, "RENDER_SOFT_RELOAD_AFTER_JOBS", 0)
+    monkeypatch.setattr(module, "_JOBS_COMPLETED", 9999)
+    assert module._soft_reload_due() is False
+
+
+def test_soft_reload_drops_the_model_singletons(svc, monkeypatch):
+    """_soft_reload() must clear the singletons, not just call empty_cache() —
+    that is the difference between reclaiming the ~7 GB and not."""
+    client, module = svc
+    import song.acestep_render as ar
+    import song.vocal_isolate as vi
+    monkeypatch.setattr(ar, "_PIPELINE", object())
+    monkeypatch.setattr(vi, "_SEPARATOR", object())
+
+    module._soft_reload()
+
+    assert ar._PIPELINE is None
+    assert vi._SEPARATOR is None
+
+
 def test_restart_disabled_by_default(svc, monkeypatch):
     """With RENDER_RESTART_AFTER_JOBS=0 the service never recycles itself, no
     matter how many jobs it has done — a bare uvicorn must not quit unexpectedly."""
