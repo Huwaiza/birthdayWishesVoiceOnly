@@ -7,6 +7,9 @@
 # These are the deps our own code (song/, generate_birthday.py, batch_render.py) needs
 # on top of whatever ACE-Step pulls in. Versions left loose so we share with ACE-Step's pins.
 numpy
+# macOS 27 refuses to load the Fortran modules in scipy <= 1.15 wheels (dyld
+# "__thread_bss ... offset field is not zero"). 1.16+ needs Python 3.11+.
+scipy>=1.16
 soundfile
 pydub
 audio-separator[cpu]  # Roformer vocal isolation, used by --acapella mode

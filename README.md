@@ -14,7 +14,7 @@ open-source music foundation model (Apache 2.0).
 After the one-time install (see below), this is your daily workflow:
 
 ```bash
-source venv-diffsinger/bin/activate
+source venv-diffsinger-upgraded/bin/activate
 
 # One song (vocals only — the default)
 python generate_birthday.py --name "Huwaiza"
@@ -323,7 +323,7 @@ birthdayVoiceOnly/
 │
 ├── cache/acestep/          WAV cache, keyed by inputs hash
 ├── tests/                  pytest unit tests (lyrics, voice_profiles)
-└── venv-diffsinger/        Python 3.10 venv (despite the legacy name)
+└── venv-diffsinger-upgraded/  Python 3.11 venv (see Install for why not 3.10)
 ```
 
 The model weights themselves (~4 GB) live outside the project, in
@@ -336,24 +336,29 @@ The model weights themselves (~4 GB) live outside the project, in
 If you're starting on a fresh Mac:
 
 ```bash
-# 1. System deps
-brew install python@3.10 ffmpeg rust
+# 1. System deps (uv also fetches and manages the Python interpreter)
+brew install uv ffmpeg rust
 
-# 2. Project venv
+# 2. Project venv — Python 3.11, not 3.10 (see below)
 cd "/path/to/birthdayVoiceOnly"
-/opt/homebrew/bin/python3.10 -m venv venv-diffsinger
-source venv-diffsinger/bin/activate
-pip install --upgrade pip wheel setuptools
+uv venv --seed --python 3.11 venv-diffsinger-upgraded
+source venv-diffsinger-upgraded/bin/activate
 
-# 3. PyTorch (with MPS for Apple Silicon)
-pip install torch torchvision torchaudio torchcodec
+# 3. Exact known-good versions: PyTorch (MPS), ACE-Step + its deps, service deps
+uv pip install -r requirements-lock.txt -e external/ACE-Step
 
-# 4. ACE-Step + project deps
-bash scripts/install_acestep.sh
-
-# 5. Smoke test (downloads ~4 GB of weights on first run)
+# 4. Smoke test (downloads ~4 GB of weights on first run)
 python scripts/smoke_test.py
 ```
+
+**Why Python 3.11.** macOS 27 tightened its dynamic loader and refuses the
+Fortran extension modules in scipy ≤ 1.15 wheels (`section '__DATA/__thread_bss'
+has a zero-fill section type, but offset field is not zero`). That breaks any
+`import scipy.sparse`, which takes transformers — and so every render — down
+with it. scipy 1.16+ loads fine but needs Python 3.11+, and 1.15.3 is the last
+scipy for 3.10, so the old 3.10 venv (`venv-diffsinger`) can't be fixed by an
+upgrade. `requirements-lock.txt` is that old venv's exact package set with only
+scipy moved to 1.16.
 
 If the smoke test produces a playable WAV at `scripts/smoke_test_out.wav`,
 you're good. Run `python generate_birthday.py --name "YourName"` for your
@@ -380,7 +385,7 @@ first real song.
 ## Tests
 
 ```bash
-source venv-diffsinger/bin/activate
+source venv-diffsinger-upgraded/bin/activate
 pytest -v
 ```
 

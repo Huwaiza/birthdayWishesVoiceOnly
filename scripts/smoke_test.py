@@ -8,7 +8,7 @@ Renders a 30-second sample to confirm:
   3. MPS is detected on Apple Silicon and the pipeline produces a WAV.
 
 Run from project root:
-    source venv-diffsinger/bin/activate
+    source venv-diffsinger-upgraded/bin/activate
     python scripts/smoke_test.py
 
 First run takes 5-15 minutes (weight download + warm-up + render).

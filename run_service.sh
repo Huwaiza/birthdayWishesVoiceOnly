@@ -27,7 +27,7 @@ export RENDER_WATCHDOG_HARD_RESTART="${RENDER_WATCHDOG_HARD_RESTART:-1}"
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8001}"
-PYBIN="${PYBIN:-venv-diffsinger/bin/uvicorn}"
+PYBIN="${PYBIN:-venv-diffsinger-upgraded/bin/uvicorn}"
 
 trap 'echo "[run_service] stopping."; exit 0' INT TERM
 

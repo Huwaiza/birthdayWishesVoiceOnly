@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install ACE-Step into the active venv on Apple Silicon.
 # Usage:
-#   source venv-diffsinger/bin/activate     # or whatever venv you're using
+#   source venv-diffsinger-upgraded/bin/activate     # or whatever venv you're using
 #   bash scripts/install_acestep.sh
 #
 # This script is idempotent — re-running it is safe.
@@ -16,7 +16,7 @@ echo "==> Project root: $PROJECT_ROOT"
 
 if [ -z "${VIRTUAL_ENV:-}" ]; then
     echo "WARNING: no virtualenv active. Activate one first, e.g.:"
-    echo "    source $PROJECT_ROOT/venv-diffsinger/bin/activate"
+    echo "    source $PROJECT_ROOT/venv-diffsinger-upgraded/bin/activate"
     exit 1
 fi
 echo "==> Using venv: $VIRTUAL_ENV"
