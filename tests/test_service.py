@@ -515,3 +515,57 @@ def test_custom_lyrics_job_renders_to_slug_file(svc):
     done = _poll(client, job_id)
     assert done["status"] == "done"
     assert Path(done["mp3_path"]).name == "lucy_300_subscribers.mp3"
+
+
+def test_generate_abandons_a_job_once_the_watchdog_fails_it(tmp_path, monkeypatch):
+    """_generate must hand the pipeline an abort hook tied to the job status:
+    False while the job runs, True once the watchdog has force-failed it.
+    Without it the worker finished (and QC-retried) dead jobs for an hour
+    while the queue behind it starved."""
+    from service import app as module
+    import song.pipeline as pipeline_mod
+
+    monkeypatch.setattr(module, "OUTPUT_DIR", tmp_path / "out")
+    job = module.Job(job_id="x", name="Adam", voice=None, duration=150.0)
+    job.status = "running"
+    seen = {}
+
+    def fake_generate_vocal_song(name, **kw):
+        should_abort = kw["should_abort"]
+        seen["while_running"] = should_abort()
+        job.status = "error"                    # what the watchdog sweep does
+        seen["after_watchdog"] = should_abort()
+        raise pipeline_mod.RenderAborted("abandoned")
+
+    monkeypatch.setattr(pipeline_mod, "generate_vocal_song",
+                        fake_generate_vocal_song)
+
+    with pytest.raises(pipeline_mod.RenderAborted):
+        module._generate(job)
+    assert seen == {"while_running": False, "after_watchdog": True}
+
+
+def test_worker_moves_on_after_abandoning_a_force_failed_job(svc, monkeypatch):
+    """End to end through the worker: the watchdog fails a slow render, the
+    pipeline aborts at the next stage, the job keeps the watchdog's error,
+    and the next queued job is rendered."""
+    client, module = svc
+    import song.pipeline as pipeline_mod
+    real_generate = module._generate
+
+    def slow_then_abandoned(job):
+        if job.name != "Slow":
+            return real_generate(job)
+        with module._JOBS_LOCK:                 # the watchdog's sweep
+            job.status = "error"
+            job.error = "render exceeded hard limit (1500s)"
+        raise pipeline_mod.RenderAborted("'Slow' abandoned before vocal isolation")
+
+    monkeypatch.setattr(module, "_generate", slow_then_abandoned)
+    slow = client.post("/jobs", json={"name": "Slow"}).json()["job_id"]
+    nxt = client.post("/jobs", json={"name": "Next"}).json()["job_id"]
+
+    assert _poll(client, nxt)["status"] == "done"
+    failed = client.get(f"/jobs/{slow}").json()
+    assert failed["status"] == "error"
+    assert "hard limit" in failed["error"]      # not overwritten by the abort

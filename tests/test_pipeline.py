@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import song.acestep_render as ar
 import song.vocal_isolate as vi
 import song.qc as qc_mod
-from song.pipeline import generate_vocal_song
+from song.pipeline import RenderAborted, generate_vocal_song
 from song.qc import QCReport
 
 
@@ -108,3 +108,44 @@ def test_guidance_and_lyrics_are_passed_through(stages, monkeypatch):
     assert kw["guidance_scale_lyric"] == 1.5
     assert kw["lyrics"] == "[verse]\ncustom"
     assert captured["custom_lyrics"] is True   # custom lyrics relax QC
+
+
+def test_abort_after_render_skips_the_remaining_stages(stages, monkeypatch):
+    """A job the watchdog already force-failed must stop at the next stage
+    boundary. Before this, the worker went on to isolate, QC and even
+    re-render a song nobody was waiting for, while real jobs sat queued."""
+    def boom(*a, **kw):
+        raise AssertionError("QC must not run for an abandoned job")
+    monkeypatch.setattr(qc_mod, "run_qc", boom)
+
+    def abort_once_rendered():
+        return "render" in stages["order"]
+
+    with pytest.raises(RenderAborted):
+        generate_vocal_song("Lucy", verbose=False,
+                            should_abort=abort_once_rendered)
+    assert stages["order"] == ["render"]
+
+
+def test_abort_prevents_the_qc_retry_render(stages, monkeypatch):
+    """The QC retry is a second full render, the single most expensive thing
+    an abandoned job could still do."""
+    state = {"abandoned": False}
+
+    def failing_qc(*a, **kw):
+        state["abandoned"] = True          # watchdog fires while QC runs
+        return _report(False)
+
+    monkeypatch.setattr(qc_mod, "run_qc", failing_qc)
+    with pytest.raises(RenderAborted):
+        generate_vocal_song("Lucy", verbose=False,
+                            should_abort=lambda: state["abandoned"])
+    assert stages["seed_offsets"] == [0]   # no second render
+
+
+def test_no_abort_hook_keeps_the_existing_behaviour(stages, monkeypatch):
+    monkeypatch.setattr(qc_mod, "run_qc", lambda *a, **kw: _report(True))
+    tight, report = generate_vocal_song("Lucy", verbose=False,
+                                        should_abort=lambda: False)
+    assert report.passed
+    assert stages["order"] == ["render", "isolate", "tighten"]

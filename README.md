@@ -336,8 +336,12 @@ The model weights themselves (~4 GB) live outside the project, in
 If you're starting on a fresh Mac:
 
 ```bash
-# 1. System deps (uv also fetches and manages the Python interpreter)
-brew install uv ffmpeg rust
+# 1. System deps (uv also fetches and manages the Python interpreter).
+#    ffmpeg@8 too: torchcodec (torchaudio's WAV writer) supports FFmpeg 4-8
+#    only, and Homebrew's plain `ffmpeg` is 9. run_service.sh points dyld at
+#    ffmpeg@8 automatically; for the CLI scripts run them with
+#    DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@8/lib venv-.../bin/python
+brew install uv ffmpeg ffmpeg@8 rust
 
 # 2. Project venv — Python 3.11, not 3.10 (see below)
 cd "/path/to/birthdayVoiceOnly"

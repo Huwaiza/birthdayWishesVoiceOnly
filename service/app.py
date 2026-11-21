@@ -54,6 +54,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from song.pipeline import RenderAborted  # stdlib-only import chain; no torch
+
 # Where finished MP3s land. Override with BIRTHDAY_OUTPUT_DIR. This is the
 # "shared folder" the Django side reads from.
 OUTPUT_DIR = Path(os.environ.get("BIRTHDAY_OUTPUT_DIR", _REPO_ROOT / "output"))
@@ -207,6 +209,13 @@ def _generate(job: Job) -> Path:
     from pydub import AudioSegment
     from song.pipeline import generate_vocal_song
 
+    def abandoned() -> bool:
+        # The watchdog flips a hung job to "error"; once that happens nobody is
+        # waiting for it, so stop at the next stage instead of holding the
+        # single worker (and ~16 GB) for isolation, QC and a QC-retry render.
+        with _JOBS_LOCK:
+            return job.status == "error"
+
     tight, report = generate_vocal_song(
         job.name,
         voice_index=job.voice,
@@ -219,6 +228,7 @@ def _generate(job: Job) -> Path:
         lyrics=job.lyrics,
         qc_enabled=job.qc,
         qc_max_retries=job.qc_max_retries,
+        should_abort=abandoned,
     )
     if report is not None:
         with _JOBS_LOCK:
@@ -322,6 +332,10 @@ def _worker() -> None:
             from song.memory import format_rss
             print(f"[service] job {job_id} done in {time.time() - t0:.0f}s → {mp3} "
                   f"{format_rss()}")
+        except RenderAborted as e:
+            # Already marked "error" by the watchdog — just say why we stopped.
+            print(f"[service] job {job_id} abandoned after watchdog force-fail "
+                  f"({e}); moving on to the queue.")
         except Exception as e:  # noqa: BLE001 — report failure, keep serving
             with _JOBS_LOCK:
                 if job.status == "running":

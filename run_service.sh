@@ -29,6 +29,21 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8001}"
 PYBIN="${PYBIN:-venv-diffsinger-upgraded/bin/uvicorn}"
 
+# FFmpeg for torchcodec, which torchaudio uses to write every render's WAV.
+# torchcodec 0.11 ships builds for FFmpeg 4-8 only; Homebrew's `ffmpeg` is now
+# 9 (libavutil.61), so without this every render fails at the save step. Point
+# dyld at the keg-only ffmpeg@8 (`brew install ffmpeg@8`). It must be set HERE:
+# macOS strips DYLD_* variables when it launches /usr/bin/env (this script's
+# shebang), so a value exported in your shell never reaches the service.
+FFMPEG8_LIB="${FFMPEG8_LIB:-/opt/homebrew/opt/ffmpeg@8/lib}"
+if [[ -d "$FFMPEG8_LIB" ]]; then
+  # Setting the fallback path replaces dyld's default, so keep that default too.
+  export DYLD_FALLBACK_LIBRARY_PATH="${FFMPEG8_LIB}:/usr/local/lib:/usr/lib"
+else
+  echo "[run_service] WARNING: ${FFMPEG8_LIB} not found. torchcodec can't use" \
+       "FFmpeg 9, so renders will fail when saving. Fix: brew install ffmpeg@8"
+fi
+
 trap 'echo "[run_service] stopping."; exit 0' INT TERM
 
 while true; do

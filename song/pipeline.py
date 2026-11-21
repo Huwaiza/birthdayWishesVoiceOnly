@@ -17,9 +17,20 @@ can see qc.passed == False and decide.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from .qc import QCReport
+
+
+class RenderAborted(RuntimeError):
+    """The caller's should_abort() hook asked to stop between stages.
+
+    The service raises this for a job its watchdog has already force-failed.
+    A diffusion pass can't be interrupted mid-way, but nothing after it has
+    to run: without this check the worker went on to isolate, QC and even
+    re-render (QC retry) a song nobody was waiting for, while the real jobs
+    queued behind it starved.
+    """
 
 
 def generate_vocal_song(
@@ -37,9 +48,15 @@ def generate_vocal_song(
     lyrics: Optional[str] = None,
     qc_enabled: bool = True,
     qc_max_retries: int = 1,
+    should_abort: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Path, Optional[QCReport]]:
     """
     Produce the final tightened vocals-only WAV for one song.
+
+    should_abort : callable or None
+        Polled before every stage (render, isolate, tighten, QC — and so
+        before a QC retry render). When it returns True the song is
+        abandoned with RenderAborted. None = never abort.
 
     Returns
     -------
@@ -56,7 +73,12 @@ def generate_vocal_song(
     attempts = (max(0, qc_max_retries) + 1) if qc_enabled else 1
     best: Optional[Tuple[Path, QCReport]] = None
 
+    def checkpoint(stage: str) -> None:
+        if should_abort is not None and should_abort():
+            raise RenderAborted(f"'{name}' abandoned before {stage}")
+
     for attempt in range(attempts):
+        checkpoint(f"render (attempt {attempt + 1}/{attempts})")
         wav = ar.render(
             name=name,
             voice_index=voice_index,
@@ -73,12 +95,14 @@ def generate_vocal_song(
         )
 
         vocals = wav.with_name(wav.stem + "__vocals.wav")
+        checkpoint("vocal isolation")
         if not (use_cache and vocals.exists()):
             vi.isolate_vocals(wav, vocals, verbose=verbose)
         elif verbose:
             print(f"[pipeline] cached vocal stem: {vocals.name}")
 
         tight = wav.with_name(wav.stem + "__vocal_tight.wav")
+        checkpoint("pause tightening")
         if not (use_cache and tight.exists()):
             vi.tighten_pauses(vocals, tight, verbose=verbose)
         elif verbose:
@@ -88,6 +112,7 @@ def generate_vocal_song(
             return tight, None
 
         from song import qc as qc_mod
+        checkpoint("QC")
         report = qc_mod.run_qc(
             tight,
             name=name,
